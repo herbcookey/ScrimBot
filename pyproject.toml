@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lol-inhouse-bot"
+version = "0.1.0"
+description = "리그 오브 레전드 5대5 디스코드 내전 봇"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.3",
+    "asyncpg>=0.29",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
