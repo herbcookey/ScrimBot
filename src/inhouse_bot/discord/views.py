@@ -9,13 +9,13 @@ from typing import Any, Awaitable, Callable
 import discord
 
 from .renderer import render_match
-from .voice import VoiceMoveSummary, move_match_participants
+from .voice import VoiceMoveSummary, ensure_match_voice_channels
 from inhouse_bot.repositories.matches import MatchError
 
 logger = logging.getLogger(__name__)
 
 SAFE_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=True)
-_ACTIVE = {"RECRUITING", "READY_CHECK", "PLAYING"}
+_ACTIVE = {"RECRUITING", "READY_CHECK", "DRAFTING", "PLAYING"}
 _TERMINAL = {"FINISHED", "CANCELLED"}
 
 
@@ -167,22 +167,24 @@ class MatchView(discord.ui.View):
 
     async def _move_voice(self, interaction: discord.Interaction, match: Any) -> VoiceMoveSummary:
         guild = getattr(interaction, "guild", None)
-        summary = await move_match_participants(
-            guild,
-            match,
+        summary = await ensure_match_voice_channels(
+            self.service, guild, match,
             self.team_a_voice_channel_id,
             self.team_b_voice_channel_id,
         )
+        await self._refresh(interaction)
         creator_id = _get(match, "creator_id")
         channel = getattr(interaction, "channel", None)
-        if channel is not None and creator_id is not None and (
-            self.team_a_voice_channel_id is not None and self.team_b_voice_channel_id is not None
-        ):
+        if channel is not None and creator_id is not None:
             try:
+                created = (
+                    f" 생성 {len(summary.created_channel_ids)}개," if summary.created_channel_ids else ""
+                )
+                error = f" 오류: {summary.error}" if summary.error else ""
                 await _safe_send(
                     channel,
-                    f"<@{int(creator_id)}> 음성 배치: 성공 {summary.success}명, "
-                    f"건너뜀 {summary.skipped}명, 실패 {summary.failed}명.",
+                    f"<@{int(creator_id)}> 보이스:{created} 이동 {summary.success}명, "
+                    f"미접속 {summary.skipped}명, 실패 {summary.failed}명.{error}",
                 )
             except Exception:
                 logger.exception("음성 채널 배치 알림 전송 실패", extra={"match_id": self.match_id})
@@ -217,6 +219,22 @@ class MatchView(discord.ui.View):
 
     async def _join(self, interaction: discord.Interaction) -> None:
         user_id = int(interaction.user.id)
+        try:
+            match = await self.service.get_match(self.match_id)
+            if bool(_get(match, "role_rating_enabled", False)):
+                await interaction.response.send_modal(
+                    JoinPreferencesModal(self, getattr(interaction, "message", None))
+                )
+                return
+        except MatchError as exc:
+            await interaction.response.send_message(_error_text(exc), ephemeral=True)
+            return
+        except Exception:
+            logger.exception("참가 지망 입력창 열기 실패", extra={"match_id": self.match_id})
+            await interaction.response.send_message(
+                "참가 처리 중 오류가 발생했습니다.", ephemeral=True
+            )
+            return
         await self._run(
             interaction,
             lambda: self.service.join_match(self.match_id, user_id),
@@ -253,6 +271,9 @@ class MatchView(discord.ui.View):
             interaction,
             lambda: self.service.toggle_ready(self.match_id, user_id),
             lambda result: (
+                "모든 참가자가 준비했습니다. 주장 지명을 시작합니다."
+                if str(_get(result, "status", "")) == "DRAFTING"
+                else
                 "모든 참가자가 준비해 내전을 시작했습니다."
                 if bool(_get(result, "started", False)) or str(_get(result, "status", "")) == "PLAYING"
                 else ("준비 완료했습니다." if _get(result, "ready", False) else "준비를 취소했습니다.")
@@ -267,8 +288,58 @@ class MatchView(discord.ui.View):
             lambda: self.service.cancel_match(
                 self.match_id, actor_id, manage_guild=self._manage_guild(interaction)
             ),
-            "내전을 취소했습니다.",
+            lambda result: (
+                f"내전을 취소했습니다. 보이스 채널은 "
+                f"{int(getattr(self.service, 'voice_cleanup_delay_seconds', 600)) // 60}분 후 삭제됩니다."
+                if _get(result, "voice_cleanup_at") is not None
+                else "내전을 취소했습니다."
+            ),
         )
 
 
-__all__ = ["MatchView", "SAFE_MENTIONS"]
+class JoinPreferencesModal(discord.ui.Modal, title="내전 참가 라인 입력"):
+    first = discord.ui.TextInput(label="1지망", placeholder="탑 / 정글 / 미드 / 원딜 / 서폿")
+    second = discord.ui.TextInput(label="2지망", placeholder="탑 / 정글 / 미드 / 원딜 / 서폿")
+    third = discord.ui.TextInput(
+        label="3지망", placeholder="선택 입력", required=False
+    )
+
+    def __init__(self, view: MatchView, message: Any | None) -> None:
+        super().__init__(custom_id=f"match:{view.match_id}:join_roles")
+        self.match_view = view
+        self.source_message = message
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        view = self.match_view
+        try:
+            result = await view.service.join_match(
+                view.match_id,
+                int(interaction.user.id),
+                preferred_role_1=str(self.first),
+                preferred_role_2=str(self.second),
+                preferred_role_3=str(self.third) or None,
+            )
+            latest = await view.service.get_match(view.match_id)
+            if latest is not None and self.source_message is not None:
+                await _safe_edit(
+                    self.source_message,
+                    embed=render_match(latest),
+                    view=MatchView(
+                        view.service,
+                        view.match_id,
+                        status=str(_get(latest, "status", "")),
+                        team_a_voice_channel_id=view.team_a_voice_channel_id,
+                        team_b_voice_channel_id=view.team_b_voice_channel_id,
+                    ),
+                )
+            text = "대기열에 등록했습니다." if _get(result, "waitlisted", False) else "내전에 참가했습니다."
+        except MatchError as exc:
+            text = _error_text(exc)
+        except Exception:
+            logger.exception("지망 라인 참가 처리 실패", extra={"match_id": view.match_id})
+            text = "참가 처리 중 오류가 발생했습니다."
+        await view._followup(interaction, text)
+
+
+__all__ = ["JoinPreferencesModal", "MatchView", "SAFE_MENTIONS"]

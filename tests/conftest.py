@@ -52,6 +52,38 @@ async def _migration_applied(conn, migration_name: str) -> bool:
               AND column_name = 'rating_snapshot'
             """
         ))
+    if migration_name.startswith("20260826025650"):
+        return bool(await conn.fetchval(
+            """
+            SELECT to_regclass('public.player_role_ratings') IS NOT NULL
+               AND to_regclass('public.role_rating_history') IS NOT NULL
+            """
+        )) and bool(await conn.fetchval(
+            """
+            SELECT count(*) = 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'match_participants'
+              AND column_name = 'assigned_role'
+            """
+        )) and bool(await conn.fetchval(
+            """
+            SELECT count(*) = 3
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND ((table_name = 'games' AND column_name = 'role_rating_enabled')
+                OR (table_name = 'matches' AND column_name IN ('assignment_mode', 'role_rating_enabled')))
+            """
+        ))
+    if migration_name.startswith("20260826034441"):
+        return bool(await conn.fetchval(
+            """SELECT count(*) = 4
+               FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = 'matches'
+                 AND column_name IN (
+                    'voice_category_id', 'team_a_voice_channel_id',
+                    'team_b_voice_channel_id', 'voice_cleanup_at'
+                 )"""
+        ))
     return False
 
 
@@ -78,7 +110,7 @@ async def db_pool():
 
 
 @pytest_asyncio.fixture
-async def service_and_scope(db_pool):
+async def service_and_scope(db_pool, request):
     from inhouse_bot.services.matches import MatchService
 
     # 다른 테스트 데이터를 건드리지 않게 매번 다른 ID를 쓴다.
@@ -86,12 +118,22 @@ async def service_and_scope(db_pool):
     guild_id = token % 9_000_000_000_000_000_000 + 1
     channel_id = (token >> 64) % 9_000_000_000_000_000_000 + 1
     service = MatchService(db_pool)
+    legacy_mode = request.module.__name__.endswith("test_matches")
+    if legacy_mode:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE games SET role_rating_enabled = FALSE WHERE \"key\" = 'lol'"
+            )
     try:
         yield service, guild_id, channel_id
     finally:
         async with db_pool.acquire() as conn:
             # 전적 테스트에서 서버 분리를 보려고 guild_id + 1도 쓴다.
             # 다음 테스트에 남지 않게 둘 다 지운다.
+            await conn.execute(
+                "DELETE FROM player_role_ratings WHERE guild_id = ANY($1::bigint[])",
+                [guild_id, guild_id + 1],
+            )
             await conn.execute(
                 "DELETE FROM player_ratings WHERE guild_id = ANY($1::bigint[])",
                 [guild_id, guild_id + 1],
@@ -108,3 +150,7 @@ async def service_and_scope(db_pool):
                 'DELETE FROM games WHERE "key" = ANY($1::text[])',
                 ["test-3v3", "test-2v2", f"test_{guild_id}"],
             )
+            if legacy_mode:
+                await conn.execute(
+                    "UPDATE games SET role_rating_enabled = TRUE WHERE \"key\" = 'lol'"
+                )

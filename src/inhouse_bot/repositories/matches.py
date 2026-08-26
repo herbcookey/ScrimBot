@@ -7,13 +7,30 @@ from datetime import datetime, timedelta, timezone
 import random
 from typing import Any, Mapping
 
+from inhouse_bot.role_assignment import (
+    DRAFT_TEAMS,
+    ROLES,
+    ROLE_LABELS,
+    RoleAssignmentError,
+    RolePlayer,
+    balanced_assignment,
+    draft_completion_possible,
+    finalize_draft,
+    initial_role_rating,
+    normalize_role,
+    positive_rating_average,
+    select_captains,
+    validate_preferences,
+)
+
 
 RECRUITING = "RECRUITING"
 READY_CHECK = "READY_CHECK"
+DRAFTING = "DRAFTING"
 PLAYING = "PLAYING"
 FINISHED = "FINISHED"
 CANCELLED = "CANCELLED"
-ACTIVE_STATUSES = (RECRUITING, READY_CHECK, PLAYING)
+ACTIVE_STATUSES = (RECRUITING, READY_CHECK, DRAFTING, PLAYING)
 WINNER_TEAMS = ("A", "B")
 MEMBER = "PARTICIPANT"
 PARTICIPANT = MEMBER
@@ -44,6 +61,11 @@ class ActiveMatchExistsError(MatchError):
 class AlreadyJoinedError(MatchError):
     code = "already_joined"
     message = "이미 내전에 참가 중입니다."
+
+
+class ActiveMembershipError(MatchError):
+    code = "active_membership"
+    message = "같은 서버의 다른 활성 내전에 이미 참가 중입니다."
 
 
 class MatchFullError(MatchError):
@@ -111,6 +133,31 @@ class InvalidRankingLimitError(MatchError):
     message = "랭킹 인원수는 1명에서 25명 사이여야 합니다."
 
 
+class InvalidRolePreferencesError(MatchError):
+    code = "invalid_role_preferences"
+    message = "라인 지망을 확인해 주세요."
+
+
+class UnplacedRoleError(MatchError):
+    code = "unplaced_role"
+    message = "배치가 끝나지 않은 라인은 지망으로 제출할 수 없습니다."
+
+
+class RoleAssignmentImpossibleError(MatchError):
+    code = "role_assignment_impossible"
+    message = "현재 지망으로는 양 팀 라인을 완성할 수 없습니다. 라인을 변경해 주세요."
+
+
+class InvalidAssignmentModeError(MatchError):
+    code = "invalid_assignment_mode"
+    message = "배정 방식은 BALANCED 또는 DRAFT여야 합니다."
+
+
+class InvalidDraftPickError(MatchError):
+    code = "invalid_draft_pick"
+    message = "현재 지명할 수 없는 사용자입니다."
+
+
 @dataclass(frozen=True, slots=True)
 class Game:
     id: int
@@ -121,6 +168,7 @@ class Game:
     default_rating: int
     k_factor: int
     rating_enabled: bool
+    role_rating_enabled: bool = False
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -144,6 +192,7 @@ class RankingEntry:
     user_id: int
     rating: int
     games_played: int
+    role: str | None = None
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -159,6 +208,27 @@ class Participant:
     joined_at: datetime | None = None
     ready_at: datetime | None = None
     rating_snapshot: int | None = None
+    preferred_role_1: str | None = None
+    preferred_role_2: str | None = None
+    preferred_role_3: str | None = None
+    assigned_role: str | None = None
+    role_rating_snapshot: int | None = None
+    draft_order: int | None = None
+    role_ratings: tuple[tuple[str, int, int], ...] = field(default_factory=tuple)
+
+    @property
+    def preferences(self) -> tuple[str, ...]:
+        return tuple(
+            role for role in (
+                self.preferred_role_1,
+                self.preferred_role_2,
+                self.preferred_role_3,
+            ) if role is not None
+        )
+
+    @property
+    def average_role_rating(self) -> int:
+        return positive_rating_average(rating for _, rating, _ in self.role_ratings)
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -196,6 +266,15 @@ class Match:
     game_name: str = "리그 오브 레전드"
     team_size: int = 5
     season_name: str = "Legacy"
+    role_rating_enabled: bool = False
+    assignment_mode: str = "BALANCED"
+    captain_a_id: int | None = None
+    captain_b_id: int | None = None
+    draft_pick_index: int = 0
+    voice_category_id: int | None = None
+    team_a_voice_channel_id: int | None = None
+    team_b_voice_channel_id: int | None = None
+    voice_cleanup_at: datetime | None = None
     recruitment_deadline_at: datetime | None = None
     recruitment_reminded_at: datetime | None = None
     ready_deadline_at: datetime | None = None
@@ -241,6 +320,9 @@ class MatchStats:
     wins: int
     losses: int
     rate: float
+    average_role_rating: int = 0
+    role_stats: tuple["RoleStats", ...] = field(default_factory=tuple)
+    highest_role_rating: int = 0
 
     @property
     def win_rate(self) -> float:
@@ -249,6 +331,20 @@ class MatchStats:
     @property
     def win_rate_percent(self) -> float:
         return self.rate * 100
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True, slots=True)
+class RoleStats:
+    role: str
+    rating: int
+    placed: bool
+    games: int
+    wins: int
+    losses: int
+    rate: float
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -323,7 +419,10 @@ class MatchRepository:
         self.pool = pool
 
     @staticmethod
-    def _participant(row: Mapping[str, Any] | Any) -> Participant:
+    def _participant(
+        row: Mapping[str, Any] | Any,
+        role_ratings: tuple[tuple[str, int, int], ...] = (),
+    ) -> Participant:
         return Participant(
             id=int(_row_value(row, "id")),
             match_id=int(_row_value(row, "match_id")),
@@ -333,6 +432,13 @@ class MatchRepository:
             joined_at=_row_value(row, "joined_at"),
             ready_at=_row_value(row, "ready_at"),
             rating_snapshot=_row_value(row, "rating_snapshot"),
+            preferred_role_1=_row_value(row, "preferred_role_1"),
+            preferred_role_2=_row_value(row, "preferred_role_2"),
+            preferred_role_3=_row_value(row, "preferred_role_3"),
+            assigned_role=_row_value(row, "assigned_role"),
+            role_rating_snapshot=_row_value(row, "role_rating_snapshot"),
+            draft_order=_row_value(row, "draft_order"),
+            role_ratings=role_ratings,
         )
 
     @staticmethod
@@ -346,6 +452,7 @@ class MatchRepository:
             default_rating=int(_row_value(row, "default_rating")),
             k_factor=int(_row_value(row, "k_factor")),
             rating_enabled=bool(_row_value(row, "rating_enabled")),
+            role_rating_enabled=bool(_row_value(row, "role_rating_enabled", False)),
         )
 
     @staticmethod
@@ -383,6 +490,15 @@ class MatchRepository:
             "game_name": str(_row_value(row, "game_name")),
             "team_size": int(_row_value(row, "team_size")),
             "season_name": str(_row_value(row, "season_name")),
+            "role_rating_enabled": bool(_row_value(row, "role_rating_enabled", False)),
+            "assignment_mode": str(_row_value(row, "assignment_mode", "BALANCED")),
+            "captain_a_id": _row_value(row, "captain_a_id"),
+            "captain_b_id": _row_value(row, "captain_b_id"),
+            "draft_pick_index": int(_row_value(row, "draft_pick_index", 0)),
+            "voice_category_id": _row_value(row, "voice_category_id"),
+            "team_a_voice_channel_id": _row_value(row, "team_a_voice_channel_id"),
+            "team_b_voice_channel_id": _row_value(row, "team_b_voice_channel_id"),
+            "voice_cleanup_at": _row_value(row, "voice_cleanup_at"),
             "creator_id": int(_row_value(row, "creator_id")),
             "title": _row_value(row, "title"),
             "capacity": int(_row_value(row, "capacity")),
@@ -401,8 +517,11 @@ class MatchRepository:
             """
             SELECT m.id, m.guild_id, m.channel_id, m.message_id, m.game_id,
                    m.season_id, g."key" AS game_key, g.name AS game_name,
-                   g.team_size, s.name AS season_name, m.creator_id, m.title,
-                   m.capacity, m.status,
+                   g.team_size, m.role_rating_enabled, s.name AS season_name,
+                   m.assignment_mode, m.captain_a_id, m.captain_b_id,
+                   m.draft_pick_index, m.voice_category_id,
+                   m.team_a_voice_channel_id, m.team_b_voice_channel_id,
+                   m.voice_cleanup_at, m.creator_id, m.title, m.capacity, m.status,
                    m.created_at, m.started_at, m.ended_at,
                    m.recruitment_deadline_at, m.recruitment_reminded_at,
                    m.ready_deadline_at, m.cancel_reason
@@ -418,7 +537,8 @@ class MatchRepository:
         items = await conn.fetch(
             """
             SELECT id, match_id, user_id, team, membership, joined_at, ready_at,
-                   rating_snapshot
+                   rating_snapshot, preferred_role_1, preferred_role_2,
+                   preferred_role_3, assigned_role, role_rating_snapshot, draft_order
             FROM match_participants WHERE match_id = $1 ORDER BY joined_at, id
             """,
             match_id,
@@ -430,8 +550,28 @@ class MatchRepository:
             """,
             match_id,
         )
-        participants = tuple(self._participant(item) for item in items if _row_value(item, "membership", MEMBER) == MEMBER)
-        waitlist = tuple(self._participant(item) for item in items if _row_value(item, "membership", MEMBER) == WAITLIST)
+        ratings = await conn.fetch(
+            """SELECT user_id, role, rating, games_played FROM player_role_ratings
+               WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                 AND user_id = ANY($4::bigint[]) ORDER BY user_id, role""",
+            int(_row_value(row, "guild_id")), int(_row_value(row, "game_id")),
+            int(_row_value(row, "season_id")),
+            [int(_row_value(item, "user_id")) for item in items],
+        ) if items else []
+        ratings_by_user: dict[int, list[tuple[str, int, int]]] = {}
+        for rating in ratings:
+            ratings_by_user.setdefault(int(_row_value(rating, "user_id")), []).append((
+                str(_row_value(rating, "role")), int(_row_value(rating, "rating")),
+                int(_row_value(rating, "games_played")),
+            ))
+        converted = tuple(
+            self._participant(
+                item, tuple(ratings_by_user.get(int(_row_value(item, "user_id")), ()))
+            )
+            for item in items
+        )
+        participants = tuple(item for item in converted if item.membership == MEMBER)
+        waitlist = tuple(item for item in converted if item.membership == WAITLIST)
         return Match(
             **self._match_row_kwargs(row),
             participants=participants,
@@ -445,7 +585,10 @@ class MatchRepository:
         row = await conn.fetchrow(
             """
             SELECT id, guild_id, channel_id, message_id, game_id, season_id, creator_id,
-                   title, capacity, status, created_at, started_at, ended_at,
+                   title, capacity, status, assignment_mode, role_rating_enabled, captain_a_id,
+                   captain_b_id, draft_pick_index, voice_category_id,
+                   team_a_voice_channel_id, team_b_voice_channel_id, voice_cleanup_at,
+                   created_at, started_at, ended_at,
                    recruitment_deadline_at, recruitment_reminded_at,
                    ready_deadline_at, cancel_reason
             FROM matches WHERE id = $1 FOR UPDATE
@@ -474,7 +617,42 @@ class MatchRepository:
         ))
 
     @staticmethod
-    async def _promote_waitlist(conn: Any, match_id: int, capacity: int) -> tuple[int, ...]:
+    async def _lock_membership(conn: Any, guild_id: int, user_id: int) -> None:
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            f"{int(guild_id)}:{int(user_id)}",
+        )
+
+    @staticmethod
+    async def _other_active_match(
+        conn: Any, guild_id: int, user_id: int, exclude_match_id: int | None = None
+    ) -> int | None:
+        return await conn.fetchval(
+            """SELECT m.id
+               FROM matches m
+               JOIN match_participants p ON p.match_id = m.id
+               WHERE m.guild_id = $1 AND p.user_id = $2
+                 AND m.ended_at IS NULL AND m.status = ANY($3::text[])
+                 AND ($4::bigint IS NULL OR m.id <> $4)
+               ORDER BY m.id LIMIT 1""",
+            guild_id, user_id, list(ACTIVE_STATUSES), exclude_match_id,
+        )
+
+    @classmethod
+    async def _require_membership_available(
+        cls, conn: Any, guild_id: int, user_id: int, exclude_match_id: int | None = None
+    ) -> None:
+        await cls._lock_membership(conn, guild_id, user_id)
+        other = await cls._other_active_match(
+            conn, guild_id, user_id, exclude_match_id
+        )
+        if other is not None:
+            raise ActiveMembershipError(f"이미 {int(other)}번째 내전에 참가 중입니다.")
+
+    @classmethod
+    async def _promote_waitlist(
+        cls, conn: Any, match_id: int, guild_id: int, capacity: int
+    ) -> tuple[int, ...]:
         promoted: list[int] = []
         while await MatchRepository._participant_count(conn, match_id) < capacity:
             waiting = await conn.fetchrow(
@@ -488,10 +666,15 @@ class MatchRepository:
             if waiting is None:
                 break
             user_id = int(_row_value(waiting, "user_id"))
+            await cls._lock_membership(conn, guild_id, user_id)
+            if await cls._other_active_match(conn, guild_id, user_id, match_id) is not None:
+                break
             await conn.execute(
                 """
                 UPDATE match_participants
-                SET membership = 'PARTICIPANT', ready_at = NULL, team = NULL
+                SET membership = 'PARTICIPANT', ready_at = NULL, team = NULL,
+                    assigned_role = NULL, rating_snapshot = NULL,
+                    role_rating_snapshot = NULL, draft_order = NULL
                 WHERE id = $1
                 """,
                 int(_row_value(waiting, "id")),
@@ -510,7 +693,9 @@ class MatchRepository:
     ) -> None:
         await conn.execute(
             """
-            UPDATE match_participants SET ready_at = NULL, team = NULL
+            UPDATE match_participants
+            SET ready_at = NULL, team = NULL, assigned_role = NULL,
+                rating_snapshot = NULL, role_rating_snapshot = NULL, draft_order = NULL
             WHERE match_id = $1 AND membership = 'PARTICIPANT'
             """,
             match_id,
@@ -539,11 +724,173 @@ class MatchRepository:
                 now + timedelta(minutes=default_recruitment_minutes),
             )
 
+    @staticmethod
+    async def _validated_role_preferences(
+        conn: Any,
+        guild_id: int,
+        game_id: int,
+        season_id: int,
+        user_id: int,
+        enabled: bool,
+        first: str | None,
+        second: str | None,
+        third: str | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        if not enabled and first is None and second is None and third is None:
+            return None, None, None
+        try:
+            preferences = validate_preferences(first or "", second or "", third)
+        except RoleAssignmentError as exc:
+            raise InvalidRolePreferencesError(str(exc)) from exc
+        if enabled:
+            placed = await conn.fetch(
+                """SELECT role FROM player_role_ratings
+                   WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                     AND user_id = $4 AND role = ANY($5::text[])""",
+                guild_id, game_id, season_id, user_id, list(preferences),
+            )
+            placed_roles = {
+                str(_row_value(row, "role")) for row in placed
+            }
+            missing = [role for role in preferences if role not in placed_roles]
+            if missing:
+                raise UnplacedRoleError(
+                    "배치가 필요한 라인: "
+                    + ", ".join(ROLE_LABELS[role] for role in missing)
+                )
+        return (
+            preferences[0], preferences[1],
+            preferences[2] if len(preferences) == 3 else None,
+        )
+
+    @staticmethod
+    async def _role_players(conn: Any, row: Any, match_id: int) -> tuple[RolePlayer, ...]:
+        participants = await conn.fetch(
+            """SELECT user_id, preferred_role_1, preferred_role_2, preferred_role_3,
+                      joined_at, team
+               FROM match_participants
+               WHERE match_id = $1 AND membership = 'PARTICIPANT'
+               ORDER BY user_id""",
+            match_id,
+        )
+        user_ids = [int(_row_value(item, "user_id")) for item in participants]
+        ratings = await conn.fetch(
+            """SELECT user_id, role, rating FROM player_role_ratings
+               WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                 AND user_id = ANY($4::bigint[]) ORDER BY user_id, role""",
+            int(_row_value(row, "guild_id")), int(_row_value(row, "game_id")),
+            int(_row_value(row, "season_id")), user_ids,
+        )
+        by_user: dict[int, dict[str, int]] = {}
+        for rating in ratings:
+            by_user.setdefault(int(_row_value(rating, "user_id")), {})[
+                str(_row_value(rating, "role"))
+            ] = int(_row_value(rating, "rating"))
+        players: list[RolePlayer] = []
+        for participant in participants:
+            user_id = int(_row_value(participant, "user_id"))
+            preferences = tuple(
+                role for role in (
+                    _row_value(participant, "preferred_role_1"),
+                    _row_value(participant, "preferred_role_2"),
+                    _row_value(participant, "preferred_role_3"),
+                ) if role is not None
+            )
+            if len(preferences) < 2:
+                raise InvalidRolePreferencesError(f"<@{user_id}>님의 라인 지망이 없습니다.")
+            missing = [role for role in preferences if role not in by_user.get(user_id, {})]
+            if missing:
+                raise UnplacedRoleError(
+                    f"<@{user_id}> 배치가 필요한 라인: "
+                    + ", ".join(ROLE_LABELS[role] for role in missing)
+                )
+            players.append(RolePlayer(
+                user_id, preferences, by_user[user_id], _row_value(participant, "joined_at")
+            ))
+        return tuple(players)
+
+    @staticmethod
+    async def _apply_role_assignments(
+        conn: Any,
+        match_id: int,
+        assignments: Any,
+        current: datetime,
+    ) -> None:
+        for assignment in assignments:
+            await conn.execute(
+                """UPDATE match_participants
+                   SET team = $3, assigned_role = $4, role_rating_snapshot = $5,
+                       rating_snapshot = NULL
+                   WHERE match_id = $1 AND user_id = $2
+                     AND membership = 'PARTICIPANT'""",
+                match_id, assignment.user_id, assignment.team,
+                assignment.role, assignment.rating,
+            )
+        await conn.execute(
+            """UPDATE matches
+               SET status = 'PLAYING', started_at = $2, ready_deadline_at = NULL,
+                   recruitment_deadline_at = NULL
+               WHERE id = $1""",
+            match_id, current,
+        )
+
+    async def set_role_rating(
+        self,
+        guild_id: int,
+        user_id: int,
+        role: str,
+        *,
+        game_key: str = "lol",
+        tier: str | None = None,
+        detail: str | int | None = None,
+        rating: int | None = None,
+        manage_guild: bool = False,
+        now: datetime | None = None,
+    ) -> int:
+        if not manage_guild:
+            raise PermissionDeniedError("서버 관리 권한이 필요합니다.")
+        try:
+            role = normalize_role(role)
+            value = int(rating) if rating is not None else initial_role_rating(tier or "", detail)
+        except (RoleAssignmentError, TypeError, ValueError) as exc:
+            raise InvalidRolePreferencesError(str(exc)) from exc
+        if not 0 <= value <= 10000:
+            raise InvalidRolePreferencesError("MMR은 0점에서 10000점 사이여야 합니다.")
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                game = await conn.fetchrow(
+                    'SELECT id, role_rating_enabled FROM games WHERE "key" = $1 FOR UPDATE',
+                    game_key,
+                )
+                if game is None:
+                    raise GameNotFoundError()
+                if not bool(_row_value(game, "role_rating_enabled")):
+                    raise InvalidRolePreferencesError("이 게임은 라인 MMR을 사용하지 않습니다.")
+                season = await conn.fetchrow(
+                    """SELECT id FROM seasons WHERE guild_id = $1 AND game_id = $2
+                       AND ended_at IS NULL FOR UPDATE""",
+                    guild_id, int(_row_value(game, "id")),
+                )
+                if season is None:
+                    raise SeasonNotFoundError("활성 시즌이 없습니다.")
+                await conn.execute(
+                    """INSERT INTO player_role_ratings
+                           (guild_id, game_id, season_id, user_id, role, rating,
+                            games_played, updated_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, 0, $7)
+                       ON CONFLICT (guild_id, game_id, season_id, user_id, role)
+                       DO UPDATE SET rating = EXCLUDED.rating, updated_at = EXCLUDED.updated_at""",
+                    guild_id, int(_row_value(game, "id")), int(_row_value(season, "id")),
+                    user_id, role, value, current,
+                )
+                return value
+
     async def list_games(self) -> list[Game]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT id, "key", name, team_size, capacity, default_rating, '
-                'k_factor, rating_enabled FROM games ORDER BY id'
+                'k_factor, rating_enabled, role_rating_enabled FROM games ORDER BY id'
             )
             return [self._game(row) for row in rows]
 
@@ -632,6 +979,11 @@ class MatchRepository:
         title: str,
         *,
         game_key: str = "lol",
+        assignment_mode: str = "BALANCED",
+        preferred_role_1: str | None = None,
+        preferred_role_2: str | None = None,
+        preferred_role_3: str | None = None,
+        voice_category_id: int | None = None,
         capacity: int | None = None,
         recruitment_minutes: int = DEFAULT_RECRUITMENT_MINUTES,
         now: datetime | None = None,
@@ -639,16 +991,29 @@ class MatchRepository:
         recruitment_minutes = _validate_recruitment_minutes(recruitment_minutes)
         created_at = _now(now)
         deadline = created_at + timedelta(minutes=recruitment_minutes)
+        assignment_mode = assignment_mode.upper()
+        if assignment_mode not in ("BALANCED", "DRAFT"):
+            raise InvalidAssignmentModeError()
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
+                    await self._require_membership_available(
+                        conn, guild_id, creator_id
+                    )
                     game = await conn.fetchrow(
                         'SELECT id, "key", name, team_size, capacity, default_rating, '
-                        'k_factor, rating_enabled FROM games WHERE "key" = $1 FOR UPDATE',
+                        'k_factor, rating_enabled, role_rating_enabled '
+                        'FROM games WHERE "key" = $1 FOR UPDATE',
                         game_key,
                     )
                     if game is None:
                         raise GameNotFoundError()
+                    if assignment_mode == "DRAFT" and not bool(
+                        _row_value(game, "role_rating_enabled")
+                    ):
+                        raise InvalidAssignmentModeError(
+                            "Draft 방식은 라인 MMR을 쓰는 게임에서만 사용할 수 있습니다."
+                        )
                     game_capacity = int(_row_value(game, "capacity"))
                     if capacity is not None and int(capacity) != game_capacity:
                         raise InvalidCapacityError(
@@ -667,12 +1032,19 @@ class MatchRepository:
                                VALUES ($1, $2, '시즌 1', $3) RETURNING id""",
                             guild_id, int(_row_value(game, "id")), created_at,
                         )
+                    preferences = await self._validated_role_preferences(
+                        conn, guild_id, int(_row_value(game, "id")),
+                        int(_row_value(season, "id")), creator_id,
+                        bool(_row_value(game, "role_rating_enabled")),
+                        preferred_role_1, preferred_role_2, preferred_role_3,
+                    )
                     row = await conn.fetchrow(
                         """
                         INSERT INTO matches
                             (guild_id, channel_id, game_id, season_id, creator_id, title,
-                             capacity, created_at, recruitment_deadline_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                             capacity, assignment_mode, role_rating_enabled,
+                             voice_category_id, created_at, recruitment_deadline_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                         RETURNING id
                         """,
                         guild_id,
@@ -682,18 +1054,24 @@ class MatchRepository:
                         creator_id,
                         title,
                         capacity,
+                        assignment_mode,
+                        bool(_row_value(game, "role_rating_enabled")),
+                        voice_category_id,
                         created_at,
                         deadline,
                     )
                     match_id = int(_row_value(row, "id"))
                     await conn.execute(
                         """
-                        INSERT INTO match_participants (match_id, user_id, membership, joined_at)
-                        VALUES ($1, $2, 'PARTICIPANT', $3)
+                        INSERT INTO match_participants
+                            (match_id, user_id, membership, joined_at,
+                             preferred_role_1, preferred_role_2, preferred_role_3)
+                        VALUES ($1, $2, 'PARTICIPANT', $3, $4, $5, $6)
                         """,
                         match_id,
                         creator_id,
                         created_at,
+                        *preferences,
                     )
                     return await self._fetch_match(conn, match_id)
         except MatchError:
@@ -708,6 +1086,9 @@ class MatchRepository:
         match_id: int,
         user_id: int,
         *,
+        preferred_role_1: str | None = None,
+        preferred_role_2: str | None = None,
+        preferred_role_3: str | None = None,
         now: datetime | None = None,
         ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
         default_recruitment_minutes: int = DEFAULT_RECRUITMENT_MINUTES,
@@ -719,6 +1100,9 @@ class MatchRepository:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_state(row, RECRUITING, READY_CHECK)
+                await self._require_membership_available(
+                    conn, int(_row_value(row, "guild_id")), user_id, match_id
+                )
                 existing = await conn.fetchrow(
                     "SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2",
                     match_id,
@@ -726,18 +1110,27 @@ class MatchRepository:
                 )
                 if existing is not None:
                     raise AlreadyJoinedError()
+                preferences = await self._validated_role_preferences(
+                    conn, int(_row_value(row, "guild_id")),
+                    int(_row_value(row, "game_id")), int(_row_value(row, "season_id")),
+                    user_id, bool(_row_value(row, "role_rating_enabled")),
+                    preferred_role_1, preferred_role_2, preferred_role_3,
+                )
                 count = await self._participant_count(conn, match_id)
                 membership = MEMBER if count < int(_row_value(row, "capacity")) else WAITLIST
                 try:
                     await conn.execute(
                         """
-                        INSERT INTO match_participants (match_id, user_id, membership, joined_at)
-                        VALUES ($1, $2, $3, $4)
+                        INSERT INTO match_participants
+                            (match_id, user_id, membership, joined_at,
+                             preferred_role_1, preferred_role_2, preferred_role_3)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
                         """,
                         match_id,
                         user_id,
                         membership,
                         current,
+                        *preferences,
                     )
                 except Exception as exc:
                     if _is_unique_violation(exc):
@@ -750,6 +1143,49 @@ class MatchRepository:
                     )
                 match = await self._fetch_match(conn, match_id)
                 return replace(match, waitlisted=membership == WAITLIST)
+
+    async def update_preferences(
+        self,
+        match_id: int,
+        user_id: int,
+        preferred_role_1: str,
+        preferred_role_2: str,
+        preferred_role_3: str | None = None,
+        *,
+        now: datetime | None = None,
+        ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
+        default_recruitment_minutes: int = DEFAULT_RECRUITMENT_MINUTES,
+    ) -> Match:
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await self._locked_match(conn, match_id)
+                self._require_state(row, RECRUITING, READY_CHECK)
+                participant = await conn.fetchrow(
+                    "SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2",
+                    match_id, user_id,
+                )
+                if participant is None:
+                    raise NotParticipantError()
+                preferences = await self._validated_role_preferences(
+                    conn, int(_row_value(row, "guild_id")), int(_row_value(row, "game_id")),
+                    int(_row_value(row, "season_id")), user_id,
+                    bool(_row_value(row, "role_rating_enabled")),
+                    preferred_role_1, preferred_role_2, preferred_role_3,
+                )
+                await conn.execute(
+                    """UPDATE match_participants
+                       SET preferred_role_1 = $3, preferred_role_2 = $4,
+                           preferred_role_3 = $5
+                       WHERE match_id = $1 AND user_id = $2""",
+                    match_id, user_id, *preferences,
+                )
+                if _row_value(row, "status") == READY_CHECK:
+                    await self._reset_ready_roster(
+                        conn, row, match_id, current,
+                        ready_timeout_seconds, default_recruitment_minutes,
+                    )
+                return await self._fetch_match(conn, match_id)
 
     async def leave_match(
         self,
@@ -780,7 +1216,10 @@ class MatchRepository:
                 )
                 promoted = ()
                 if membership == MEMBER:
-                    promoted = await self._promote_waitlist(conn, match_id, int(_row_value(row, "capacity")))
+                    promoted = await self._promote_waitlist(
+                        conn, match_id, int(_row_value(row, "guild_id")),
+                        int(_row_value(row, "capacity")),
+                    )
                     if _row_value(row, "status") == READY_CHECK:
                         await self._reset_ready_roster(
                             conn, row, match_id, current,
@@ -818,7 +1257,10 @@ class MatchRepository:
                     )
                 await conn.execute(
                     """
-                    UPDATE match_participants SET ready_at = NULL, team = NULL
+                    UPDATE match_participants
+                    SET ready_at = NULL, team = NULL, assigned_role = NULL,
+                        rating_snapshot = NULL, role_rating_snapshot = NULL,
+                        draft_order = NULL
                     WHERE match_id = $1 AND membership = 'PARTICIPANT'
                     """,
                     match_id,
@@ -888,65 +1330,169 @@ class MatchRepository:
                 started = False
                 if not was_ready and ready_count == int(_row_value(row, "capacity")):
                     game = await conn.fetchrow(
-                        """SELECT team_size, capacity, default_rating
+                        """SELECT team_size, capacity, default_rating, role_rating_enabled
                            FROM games WHERE id = $1""",
                         int(_row_value(row, "game_id")),
                     )
                     team_size = int(_row_value(game, "team_size"))
                     if int(_row_value(row, "capacity")) != team_size * 2:
                         raise InvalidCapacityError()
-                    rows = await conn.fetch(
-                        """
-                        SELECT user_id FROM match_participants
-                        WHERE match_id = $1 AND membership = 'PARTICIPANT'
-                        ORDER BY joined_at, id
-                        """,
-                        match_id,
-                    )
-                    user_ids = [int(_row_value(item, "user_id")) for item in rows]
-                    if len(user_ids) != int(_row_value(row, "capacity")):
-                        raise InvalidMatchStateError()
-                    random.shuffle(user_ids)
-                    ratings = await conn.fetch(
-                        """SELECT user_id, rating FROM player_ratings
-                           WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
-                             AND user_id = ANY($4::bigint[])""",
-                        int(_row_value(row, "guild_id")),
-                        int(_row_value(row, "game_id")),
-                        int(_row_value(row, "season_id")),
-                        user_ids,
-                    )
-                    rating_by_user = {
-                        int(_row_value(item, "user_id")): int(_row_value(item, "rating"))
-                        for item in ratings
-                    }
-                    default_rating = int(_row_value(game, "default_rating"))
-                    for team, members in (
-                        ("A", user_ids[:team_size]),
-                        ("B", user_ids[team_size:]),
-                    ):
-                        for member_id in members:
-                            await conn.execute(
-                                """
-                                UPDATE match_participants
-                                SET team = $3, rating_snapshot = $4
-                                WHERE match_id = $1 AND user_id = $2 AND membership = 'PARTICIPANT'
-                                """,
-                                match_id, member_id, team,
-                                rating_by_user.get(member_id, default_rating),
-                            )
-                    await conn.execute(
-                        """
-                        UPDATE matches
-                        SET status = 'PLAYING', started_at = $2,
-                            ready_deadline_at = NULL, recruitment_deadline_at = NULL
-                        WHERE id = $1 AND status = 'READY_CHECK'
-                        """,
-                        match_id, current,
-                    )
-                    started = True
+                    if bool(_row_value(row, "role_rating_enabled")):
+                        if int(_row_value(row, "capacity")) != 10 or team_size != 5:
+                            raise InvalidCapacityError("라인 배정 게임은 현재 5대5만 지원합니다.")
+                        players = await self._role_players(conn, row, match_id)
+                        try:
+                            if _row_value(row, "assignment_mode") == "DRAFT":
+                                captain_a, captain_b = select_captains(players)
+                                teams = {captain_a: "A", captain_b: "B"}
+                                if not draft_completion_possible(players, teams, match_id):
+                                    raise RoleAssignmentError(
+                                        "주장 배치 후 유효한 라인 조합을 만들 수 없습니다."
+                                    )
+                                await conn.execute(
+                                    """UPDATE match_participants
+                                       SET team = NULL, assigned_role = NULL,
+                                           role_rating_snapshot = NULL, draft_order = NULL
+                                       WHERE match_id = $1 AND membership = 'PARTICIPANT'""",
+                                    match_id,
+                                )
+                                await conn.execute(
+                                    """UPDATE match_participants SET team = 'A'
+                                       WHERE match_id = $1 AND user_id = $2""",
+                                    match_id, captain_a,
+                                )
+                                await conn.execute(
+                                    """UPDATE match_participants SET team = 'B'
+                                       WHERE match_id = $1 AND user_id = $2""",
+                                    match_id, captain_b,
+                                )
+                                await conn.execute(
+                                    """UPDATE matches SET status = 'DRAFTING',
+                                           captain_a_id = $2, captain_b_id = $3,
+                                           draft_pick_index = 0, ready_deadline_at = NULL,
+                                           recruitment_deadline_at = NULL
+                                       WHERE id = $1""",
+                                    match_id, captain_a, captain_b,
+                                )
+                            else:
+                                assignments = balanced_assignment(players, match_id)
+                                await self._apply_role_assignments(
+                                    conn, match_id, assignments, current
+                                )
+                                started = True
+                        except RoleAssignmentError as exc:
+                            raise RoleAssignmentImpossibleError(str(exc)) from exc
+                    else:
+                        rows = await conn.fetch(
+                            """SELECT user_id FROM match_participants
+                               WHERE match_id = $1 AND membership = 'PARTICIPANT'
+                               ORDER BY joined_at, id""",
+                            match_id,
+                        )
+                        user_ids = [int(_row_value(item, "user_id")) for item in rows]
+                        if len(user_ids) != int(_row_value(row, "capacity")):
+                            raise InvalidMatchStateError()
+                        random.shuffle(user_ids)
+                        ratings = await conn.fetch(
+                            """SELECT user_id, rating FROM player_ratings
+                               WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                                 AND user_id = ANY($4::bigint[])""",
+                            int(_row_value(row, "guild_id")),
+                            int(_row_value(row, "game_id")),
+                            int(_row_value(row, "season_id")), user_ids,
+                        )
+                        rating_by_user = {
+                            int(_row_value(item, "user_id")): int(_row_value(item, "rating"))
+                            for item in ratings
+                        }
+                        default_rating = int(_row_value(game, "default_rating"))
+                        for team, members in (("A", user_ids[:team_size]), ("B", user_ids[team_size:])):
+                            for member_id in members:
+                                await conn.execute(
+                                    """UPDATE match_participants
+                                       SET team = $3, rating_snapshot = $4
+                                       WHERE match_id = $1 AND user_id = $2
+                                         AND membership = 'PARTICIPANT'""",
+                                    match_id, member_id, team,
+                                    rating_by_user.get(member_id, default_rating),
+                                )
+                        await conn.execute(
+                            """UPDATE matches SET status = 'PLAYING', started_at = $2,
+                                   ready_deadline_at = NULL, recruitment_deadline_at = NULL
+                               WHERE id = $1 AND status = 'READY_CHECK'""",
+                            match_id, current,
+                        )
+                        started = True
                 match = await self._fetch_match(conn, match_id)
                 return replace(match, ready=not was_ready, started=started)
+
+    async def draft_pick(
+        self,
+        match_id: int,
+        actor_id: int,
+        target_user_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> Match:
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await self._locked_match(conn, match_id)
+                self._require_state(row, DRAFTING)
+                index = int(_row_value(row, "draft_pick_index"))
+                if index >= len(DRAFT_TEAMS):
+                    raise InvalidDraftPickError("지명이 이미 끝났습니다.")
+                team = DRAFT_TEAMS[index]
+                captain_id = int(_row_value(row, "captain_a_id" if team == "A" else "captain_b_id"))
+                if int(actor_id) != captain_id:
+                    raise PermissionDeniedError("현재 차례의 주장만 지명할 수 있습니다.")
+                target = await conn.fetchrow(
+                    """SELECT team FROM match_participants
+                       WHERE match_id = $1 AND user_id = $2
+                         AND membership = 'PARTICIPANT' FOR UPDATE""",
+                    match_id, target_user_id,
+                )
+                if target is None or _row_value(target, "team") is not None:
+                    raise InvalidDraftPickError()
+                await conn.execute(
+                    """UPDATE match_participants SET team = $3, draft_order = $4
+                       WHERE match_id = $1 AND user_id = $2""",
+                    match_id, target_user_id, team, index + 1,
+                )
+                players = await self._role_players(conn, row, match_id)
+                teams = {
+                    int(_row_value(item, "user_id")): str(_row_value(item, "team"))
+                    for item in await conn.fetch(
+                        """SELECT user_id, team FROM match_participants
+                           WHERE match_id = $1 AND membership = 'PARTICIPANT'
+                             AND team IS NOT NULL ORDER BY user_id""",
+                        match_id,
+                    )
+                }
+                if not draft_completion_possible(players, teams, match_id):
+                    raise InvalidDraftPickError(
+                        "이 사용자를 지명하면 유효한 라인 배정을 만들 수 없습니다."
+                    )
+                started = False
+                if index + 1 == len(DRAFT_TEAMS):
+                    try:
+                        assignments = finalize_draft(players, teams, match_id)
+                    except RoleAssignmentError as exc:
+                        raise InvalidDraftPickError(str(exc)) from exc
+                    await self._apply_role_assignments(
+                        conn, match_id, assignments, current
+                    )
+                    await conn.execute(
+                        "UPDATE matches SET draft_pick_index = $2 WHERE id = $1",
+                        match_id, len(DRAFT_TEAMS),
+                    )
+                    started = True
+                else:
+                    await conn.execute(
+                        "UPDATE matches SET draft_pick_index = $2 WHERE id = $1",
+                        match_id, index + 1,
+                    )
+                return replace(await self._fetch_match(conn, match_id), started=started)
 
     async def kick_match_member(
         self,
@@ -980,7 +1526,10 @@ class MatchRepository:
                 )
                 promoted = ()
                 if membership == MEMBER:
-                    promoted = await self._promote_waitlist(conn, match_id, int(_row_value(row, "capacity")))
+                    promoted = await self._promote_waitlist(
+                        conn, match_id, int(_row_value(row, "guild_id")),
+                        int(_row_value(row, "capacity")),
+                    )
                     if _row_value(row, "status") == READY_CHECK:
                         await self._reset_ready_roster(
                             conn, row, match_id, current,
@@ -1002,21 +1551,28 @@ class MatchRepository:
         manage_guild: bool = False,
         reason: str | None = None,
         now: datetime | None = None,
+        voice_cleanup_delay_seconds: int = 600,
     ) -> Match:
         current = _now(now)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_manager(row, actor_id, manage_guild)
-                self._require_state(row, RECRUITING, READY_CHECK, PLAYING)
+                self._require_state(row, RECRUITING, READY_CHECK, DRAFTING, PLAYING)
                 await conn.execute(
                     """
                     UPDATE matches
                     SET status = 'CANCELLED', ended_at = $2,
-                        ready_deadline_at = NULL, cancel_reason = $3
+                        ready_deadline_at = NULL, cancel_reason = $3,
+                        voice_cleanup_at = CASE
+                            WHEN team_a_voice_channel_id IS NOT NULL
+                              OR team_b_voice_channel_id IS NOT NULL
+                            THEN $2 + ($4 * interval '1 second')
+                            ELSE NULL END
                     WHERE id = $1
                     """,
                     match_id, current, reason or "직접 취소",
+                    int(voice_cleanup_delay_seconds),
                 )
                 return await self._fetch_match(conn, match_id)
 
@@ -1029,6 +1585,7 @@ class MatchRepository:
         *,
         manage_guild: bool = False,
         now: datetime | None = None,
+        voice_cleanup_delay_seconds: int = 600,
     ) -> Match:
         if winner_team not in WINNER_TEAMS:
             raise InvalidWinnerTeamError()
@@ -1046,12 +1603,13 @@ class MatchRepository:
                             raise ResultAlreadyRecordedError()
                     raise InvalidMatchStateError()
                 game = await conn.fetchrow(
-                    """SELECT default_rating, k_factor, rating_enabled
+                    """SELECT default_rating, k_factor, rating_enabled, role_rating_enabled
                        FROM games WHERE id = $1""",
                     int(_row_value(row, "game_id")),
                 )
                 participants = await conn.fetch(
-                    """SELECT user_id, team, rating_snapshot
+                    """SELECT user_id, team, rating_snapshot, assigned_role,
+                              role_rating_snapshot
                        FROM match_participants
                        WHERE match_id = $1 AND membership = 'PARTICIPANT'
                          AND team IN ('A', 'B')
@@ -1072,7 +1630,70 @@ class MatchRepository:
                     if _is_unique_violation(exc):
                         raise ResultAlreadyRecordedError() from exc
                     raise
-                if bool(_row_value(game, "rating_enabled")):
+                if bool(_row_value(row, "role_rating_enabled")):
+                    user_ids = sorted(int(_row_value(item, "user_id")) for item in participants)
+                    if any(
+                        _row_value(item, "assigned_role") not in ROLES
+                        or _row_value(item, "role_rating_snapshot") is None
+                        for item in participants
+                    ):
+                        raise InvalidMatchStateError("라인 배정 정보가 올바르지 않습니다.")
+                    rating_rows = await conn.fetch(
+                        """SELECT user_id, role, rating FROM player_role_ratings
+                           WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                             AND user_id = ANY($4::bigint[])
+                           ORDER BY user_id, role FOR UPDATE""",
+                        int(_row_value(row, "guild_id")), int(_row_value(row, "game_id")),
+                        int(_row_value(row, "season_id")), user_ids,
+                    )
+                    current_ratings = {
+                        (int(_row_value(item, "user_id")), str(_row_value(item, "role"))):
+                            int(_row_value(item, "rating"))
+                        for item in rating_rows
+                    }
+                    by_team: dict[str, list[int]] = {"A": [], "B": []}
+                    participant_data: dict[int, tuple[str, str]] = {}
+                    for participant in participants:
+                        participant_id = int(_row_value(participant, "user_id"))
+                        team = str(_row_value(participant, "team"))
+                        role = str(_row_value(participant, "assigned_role"))
+                        if (participant_id, role) not in current_ratings:
+                            raise UnplacedRoleError(
+                                f"<@{participant_id}>님의 {ROLE_LABELS[role]} MMR이 없습니다."
+                            )
+                        participant_data[participant_id] = team, role
+                        by_team[team].append(int(_row_value(participant, "role_rating_snapshot")))
+                    if len(by_team["A"]) != len(by_team["B"]) or not by_team["A"]:
+                        raise InvalidMatchStateError("팀 인원이 올바르지 않습니다.")
+                    delta_a, delta_b = calculate_rating_delta(
+                        sum(by_team["A"]) / len(by_team["A"]),
+                        sum(by_team["B"]) / len(by_team["B"]),
+                        winner_team,
+                        int(_row_value(game, "k_factor")),
+                    )
+                    for participant_id in user_ids:
+                        team, role = participant_data[participant_id]
+                        before = current_ratings[(participant_id, role)]
+                        delta = delta_a if team == "A" else delta_b
+                        after = before + delta
+                        await conn.execute(
+                            """UPDATE player_role_ratings
+                               SET rating = $6, games_played = games_played + 1,
+                                   updated_at = $7
+                               WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                                 AND user_id = $4 AND role = $5""",
+                            int(_row_value(row, "guild_id")), int(_row_value(row, "game_id")),
+                            int(_row_value(row, "season_id")), participant_id,
+                            role, after, current,
+                        )
+                        await conn.execute(
+                            """INSERT INTO role_rating_history
+                                   (match_id, user_id, role, rating_before,
+                                    rating_delta, rating_after, created_at)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                            match_id, participant_id, role, before, delta, after, current,
+                        )
+                elif bool(_row_value(game, "rating_enabled")):
                     default_rating = int(_row_value(game, "default_rating"))
                     user_ids = sorted(int(_row_value(item, "user_id")) for item in participants)
                     for user_id in user_ids:
@@ -1142,9 +1763,15 @@ class MatchRepository:
                 await conn.execute(
                     """
                     UPDATE matches SET status = 'FINISHED', ended_at = $2,
-                        ready_deadline_at = NULL WHERE id = $1
+                        ready_deadline_at = NULL,
+                        voice_cleanup_at = CASE
+                            WHEN team_a_voice_channel_id IS NOT NULL
+                              OR team_b_voice_channel_id IS NOT NULL
+                            THEN $2 + ($3 * interval '1 second')
+                            ELSE NULL END
+                    WHERE id = $1
                     """,
-                    match_id, current,
+                    match_id, current, int(voice_cleanup_delay_seconds),
                 )
                 return await self._fetch_match(conn, match_id)
 
@@ -1157,26 +1784,100 @@ class MatchRepository:
         season_id: int | None = None,
     ) -> MatchStats:
         async with self.pool.acquire() as conn:
+            game = await conn.fetchrow(
+                'SELECT id, role_rating_enabled FROM games WHERE "key" = $1', game_key
+            )
+            if game is None:
+                raise GameNotFoundError()
+            game_id = int(_row_value(game, "id"))
+            effective_season_id = season_id
+            if bool(_row_value(game, "role_rating_enabled")) and effective_season_id is None:
+                effective_season_id = await conn.fetchval(
+                    """SELECT id FROM seasons WHERE guild_id = $1 AND game_id = $2
+                       AND ended_at IS NULL""",
+                    guild_id, game_id,
+                )
+                if effective_season_id is None:
+                    return MatchStats(
+                        0, 0, 0, 0.0, 0,
+                        tuple(RoleStats(role, 0, False, 0, 0, 0, 0.0) for role in ROLES),
+                        0,
+                    )
             row = await conn.fetchrow(
                 """
                 SELECT count(*) AS games,
                        count(*) FILTER (WHERE p.team = r.winner_team) AS wins
                 FROM matches m
-                JOIN games g ON g.id = m.game_id
                 JOIN match_participants p ON p.match_id = m.id
                 JOIN match_results r ON r.match_id = m.id
                 WHERE m.guild_id = $1 AND m.status = 'FINISHED'
                   AND p.user_id = $2 AND p.membership = 'PARTICIPANT'
                   AND p.team IS NOT NULL
-                  AND g."key" = $3
+                  AND m.game_id = $3
                   AND ($4::bigint IS NULL OR m.season_id = $4)
                 """,
-                guild_id, user_id, game_key, season_id,
+                guild_id, user_id, game_id, effective_season_id,
             )
             games = int(_row_value(row, "games", 0) or 0)
             wins = int(_row_value(row, "wins", 0) or 0)
             losses = games - wins
-            return MatchStats(games, wins, losses, wins / games if games else 0.0)
+            if not bool(_row_value(game, "role_rating_enabled")) or effective_season_id is None:
+                return MatchStats(games, wins, losses, wins / games if games else 0.0)
+            rating_rows = await conn.fetch(
+                """SELECT role, rating, games_played FROM player_role_ratings
+                   WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                     AND user_id = $4 ORDER BY role""",
+                guild_id, game_id, int(effective_season_id), user_id,
+            )
+            ratings = {
+                str(_row_value(item, "role")): (
+                    int(_row_value(item, "rating")), int(_row_value(item, "games_played"))
+                ) for item in rating_rows
+            }
+            result_rows = await conn.fetch(
+                """SELECT p.assigned_role AS role, count(*) AS games,
+                          count(*) FILTER (WHERE p.team = r.winner_team) AS wins
+                   FROM matches m
+                   JOIN match_participants p ON p.match_id = m.id
+                   JOIN match_results r ON r.match_id = m.id
+                   WHERE m.guild_id = $1 AND m.game_id = $2 AND m.season_id = $3
+                     AND m.status = 'FINISHED' AND p.user_id = $4
+                     AND p.membership = 'PARTICIPANT' AND p.assigned_role IS NOT NULL
+                   GROUP BY p.assigned_role""",
+                guild_id, game_id, int(effective_season_id), user_id,
+            )
+            results = {
+                str(_row_value(item, "role")): (
+                    int(_row_value(item, "games")), int(_row_value(item, "wins"))
+                ) for item in result_rows
+            }
+            role_stats = []
+            for role in ROLES:
+                rating, _rating_games = ratings.get(role, (0, 0))
+                role_games, role_wins = results.get(role, (0, 0))
+                role_stats.append(RoleStats(
+                    role, rating, role in ratings, role_games, role_wins,
+                    role_games - role_wins,
+                    role_wins / role_games if role_games else 0.0,
+                ))
+            highest = await conn.fetchval(
+                """SELECT max(value) FROM (
+                       SELECT rating AS value FROM player_role_ratings
+                       WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                         AND user_id = $4
+                       UNION ALL
+                       SELECT greatest(rating_before, rating_after) FROM role_rating_history h
+                       JOIN matches m ON m.id = h.match_id
+                       WHERE m.guild_id = $1 AND m.game_id = $2 AND m.season_id = $3
+                         AND h.user_id = $4
+                   ) AS rating_values""",
+                guild_id, game_id, int(effective_season_id), user_id,
+            )
+            return MatchStats(
+                games, wins, losses, wins / games if games else 0.0,
+                positive_rating_average(rating for rating, _ in ratings.values()),
+                tuple(role_stats), int(highest or 0),
+            )
 
     async def ranking(
         self,
@@ -1184,12 +1885,15 @@ class MatchRepository:
         *,
         game_key: str = "lol",
         season_id: int | None = None,
+        role: str | None = None,
         limit: int = 10,
     ) -> list[RankingEntry]:
         if not 1 <= int(limit) <= 25:
             raise InvalidRankingLimitError()
         async with self.pool.acquire() as conn:
-            game = await conn.fetchrow('SELECT id FROM games WHERE "key" = $1', game_key)
+            game = await conn.fetchrow(
+                'SELECT id, role_rating_enabled FROM games WHERE "key" = $1', game_key
+            )
             if game is None:
                 raise GameNotFoundError()
             game_id = int(_row_value(game, "id"))
@@ -1208,17 +1912,45 @@ class MatchRepository:
                 )
             if season is None:
                 raise SeasonNotFoundError()
-            rows = await conn.fetch(
-                """SELECT user_id, rating, games_played FROM player_ratings
-                   WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
-                   ORDER BY rating DESC, games_played DESC, user_id ASC LIMIT $4""",
-                guild_id, game_id, int(_row_value(season, "id")), int(limit),
-            )
+            if bool(_row_value(game, "role_rating_enabled")):
+                if role is not None:
+                    try:
+                        role = normalize_role(role)
+                    except RoleAssignmentError as exc:
+                        raise InvalidRolePreferencesError(str(exc)) from exc
+                    rows = await conn.fetch(
+                        """SELECT user_id, rating, games_played FROM player_role_ratings
+                           WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                             AND role = $4
+                           ORDER BY rating DESC, games_played DESC, user_id ASC LIMIT $5""",
+                        guild_id, game_id, int(_row_value(season, "id")), role, int(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """SELECT user_id, floor(avg(rating))::integer AS rating,
+                                  sum(games_played)::integer AS games_played
+                           FROM player_role_ratings
+                           WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                             AND rating > 0
+                           GROUP BY user_id
+                           ORDER BY rating DESC, games_played DESC, user_id ASC LIMIT $4""",
+                        guild_id, game_id, int(_row_value(season, "id")), int(limit),
+                    )
+            else:
+                if role is not None:
+                    raise InvalidRolePreferencesError("이 게임은 라인 랭킹을 사용하지 않습니다.")
+                rows = await conn.fetch(
+                    """SELECT user_id, rating, games_played FROM player_ratings
+                       WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                       ORDER BY rating DESC, games_played DESC, user_id ASC LIMIT $4""",
+                    guild_id, game_id, int(_row_value(season, "id")), int(limit),
+                )
             return [
                 RankingEntry(
                     int(_row_value(item, "user_id")),
                     int(_row_value(item, "rating")),
                     int(_row_value(item, "games_played")),
+                    role,
                 )
                 for item in rows
             ]
@@ -1272,7 +2004,9 @@ class MatchRepository:
                                 await conn.execute(
                                     """
                                     UPDATE match_participants
-                                    SET ready_at = NULL, team = NULL
+                                    SET ready_at = NULL, team = NULL, assigned_role = NULL,
+                                        rating_snapshot = NULL, role_rating_snapshot = NULL,
+                                        draft_order = NULL
                                     WHERE match_id = $1 AND membership = 'PARTICIPANT'
                                     """,
                                     match_id,
@@ -1333,7 +2067,8 @@ class MatchRepository:
                                 match_id, user_id,
                             )
                         promoted = await self._promote_waitlist(
-                            conn, match_id, int(_row_value(row, "capacity"))
+                            conn, match_id, int(_row_value(row, "guild_id")),
+                            int(_row_value(row, "capacity")),
                         )
                         await self._reset_ready_roster(
                             conn, row, match_id, current,
@@ -1393,6 +2128,65 @@ class MatchRepository:
                 )
             return [await self._fetch_match(conn, int(_row_value(row, "id"))) for row in rows]
 
+    async def set_voice_channel_id(
+        self, match_id: int, team: str, channel_id: int, *, replace_missing: bool = False
+    ) -> Match:
+        if team not in ("A", "B"):
+            raise InvalidMatchStateError("보이스 팀은 A 또는 B여야 합니다.")
+        column = "team_a_voice_channel_id" if team == "A" else "team_b_voice_channel_id"
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await self._locked_match(conn, match_id)
+                self._require_state(row, PLAYING)
+                current = _row_value(row, column)
+                if current is not None and int(current) != int(channel_id) and not replace_missing:
+                    raise InvalidMatchStateError(
+                        f"{team}팀 보이스 채널이 이미 다른 ID로 저장되어 있습니다."
+                    )
+                await conn.execute(
+                    f"UPDATE matches SET {column} = $2 WHERE id = $1",
+                    match_id, channel_id,
+                )
+                return await self._fetch_match(conn, match_id)
+
+    async def list_due_voice_cleanups(self, now: datetime | None = None) -> list[Match]:
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id FROM matches
+                   WHERE voice_cleanup_at IS NOT NULL AND voice_cleanup_at <= $1
+                   ORDER BY voice_cleanup_at, id""",
+                current,
+            )
+            return [
+                await self._fetch_match(conn, int(_row_value(row, "id")))
+                for row in rows
+            ]
+
+    async def record_voice_cleanup(
+        self,
+        match_id: int,
+        *,
+        clear_team_a: bool,
+        clear_team_b: bool,
+        retry_at: datetime | None,
+    ) -> Match:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await self._locked_match(conn, match_id)
+                team_a = None if clear_team_a else _row_value(row, "team_a_voice_channel_id")
+                team_b = None if clear_team_b else _row_value(row, "team_b_voice_channel_id")
+                cleanup_at = retry_at if team_a is not None or team_b is not None else None
+                await conn.execute(
+                    """UPDATE matches
+                       SET team_a_voice_channel_id = $2,
+                           team_b_voice_channel_id = $3,
+                           voice_cleanup_at = $4
+                       WHERE id = $1""",
+                    match_id, team_a, team_b, cleanup_at,
+                )
+                return await self._fetch_match(conn, match_id)
+
     async def update_message_id(self, match_id: int, message_id: int | None) -> Match:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -1402,7 +2196,9 @@ class MatchRepository:
                 )
                 return await self._fetch_match(conn, match_id)
 
-    async def cancel_missing_message(self, match_id: int) -> Match:
+    async def cancel_missing_message(
+        self, match_id: int, *, voice_cleanup_delay_seconds: int = 600
+    ) -> Match:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
@@ -1411,9 +2207,14 @@ class MatchRepository:
                     await conn.execute(
                         """
                         UPDATE matches SET status = 'CANCELLED', ended_at = now(),
-                            ready_deadline_at = NULL, cancel_reason = '모집 메시지를 찾을 수 없음'
+                            ready_deadline_at = NULL, cancel_reason = '모집 메시지를 찾을 수 없음',
+                            voice_cleanup_at = CASE
+                                WHEN team_a_voice_channel_id IS NOT NULL
+                                  OR team_b_voice_channel_id IS NOT NULL
+                                THEN now() + ($2 * interval '1 second')
+                                ELSE NULL END
                         WHERE id = $1 AND ended_at IS NULL
                         """,
-                        match_id,
+                        match_id, int(voice_cleanup_delay_seconds),
                     )
                 return await self._fetch_match(conn, match_id)

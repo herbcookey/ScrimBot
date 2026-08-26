@@ -11,9 +11,29 @@ from discord import app_commands
 
 from .renderer import render_match
 from .views import MatchView, SAFE_MENTIONS
+from .voice import ensure_match_voice_channels, resolve_voice_category_id
 from inhouse_bot.repositories.matches import MatchError
+from inhouse_bot.role_assignment import ROLE_LABELS
 
 logger = logging.getLogger(__name__)
+
+ROLE_CHOICES = [
+    app_commands.Choice(name=name, value=value)
+    for name, value in (("탑", "TOP"), ("정글", "JUNGLE"), ("미드", "MID"), ("원딜", "ADC"), ("서폿", "SUPPORT"))
+]
+TIER_CHOICES = [
+    app_commands.Choice(name=name, value=value)
+    for name, value in (
+        ("아이언", "IRON"), ("브론즈", "BRONZE"), ("실버", "SILVER"),
+        ("골드", "GOLD"), ("플래티넘", "PLATINUM"), ("에메랄드", "EMERALD"),
+        ("다이아", "DIAMOND"), ("마스터", "MASTER"),
+        ("그랜드마스터", "GRANDMASTER"), ("챌린저", "CHALLENGER"),
+    )
+]
+
+
+def _choice_value(value: Any, default: Any = None) -> Any:
+    return getattr(value, "value", value) if value is not None else default
 
 
 def _get(value: Any, name: str, default: Any = None) -> Any:
@@ -45,11 +65,13 @@ class MatchCommandGroup(app_commands.Group):
         *,
         team_a_voice_channel_id: int | None = None,
         team_b_voice_channel_id: int | None = None,
+        inhouse_voice_category_id: int | None = None,
     ) -> None:
         super().__init__(name="내전", description="게임 내전 관리")
         self.service = service
         self.team_a_voice_channel_id = team_a_voice_channel_id
         self.team_b_voice_channel_id = team_b_voice_channel_id
+        self.inhouse_voice_category_id = inhouse_voice_category_id
 
     @staticmethod
     def _manage_guild(interaction: discord.Interaction) -> bool:
@@ -91,14 +113,35 @@ class MatchCommandGroup(app_commands.Group):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="생성", description="새 내전을 생성합니다.")
-    @app_commands.describe(title="내전 제목", recruitment_minutes="모집시간(분)", game="게임")
-    @app_commands.rename(title="제목", recruitment_minutes="모집시간", game="게임")
+    @app_commands.describe(
+        title="내전 제목", recruitment_minutes="모집시간(분)", game="게임",
+        assignment_mode="팀 배정 방식", preferred_role_1="생성자 1지망",
+        preferred_role_2="생성자 2지망", preferred_role_3="생성자 3지망",
+    )
+    @app_commands.rename(
+        title="제목", recruitment_minutes="모집시간", game="게임",
+        assignment_mode="방식", preferred_role_1="1지망",
+        preferred_role_2="2지망", preferred_role_3="3지망",
+    )
+    @app_commands.choices(
+        assignment_mode=[
+            app_commands.Choice(name="Balanced", value="BALANCED"),
+            app_commands.Choice(name="Draft", value="DRAFT"),
+        ],
+        preferred_role_1=ROLE_CHOICES,
+        preferred_role_2=ROLE_CHOICES,
+        preferred_role_3=ROLE_CHOICES,
+    )
     async def create(
         self,
         interaction: discord.Interaction,
         title: str,
         recruitment_minutes: app_commands.Range[int, 5, 1440] | None = None,
         game: str | None = None,
+        assignment_mode: app_commands.Choice[str] | None = None,
+        preferred_role_1: app_commands.Choice[str] | None = None,
+        preferred_role_2: app_commands.Choice[str] | None = None,
+        preferred_role_3: app_commands.Choice[str] | None = None,
     ) -> None:
         if interaction.guild is None or interaction.channel is None:
             await self._send(interaction, "서버 채널에서만 사용할 수 있습니다.")
@@ -109,12 +152,27 @@ class MatchCommandGroup(app_commands.Group):
             return
         await self._defer(interaction)
         try:
+            voice_category_id, voice_category_error = resolve_voice_category_id(
+                interaction.guild,
+                interaction.channel,
+                self.inhouse_voice_category_id,
+                self.team_a_voice_channel_id,
+                self.team_b_voice_channel_id,
+            )
+            if self.inhouse_voice_category_id is not None and voice_category_error:
+                await self._send(interaction, voice_category_error)
+                return
             created = await self.service.create_match(
                 guild_id=int(interaction.guild.id),
                 channel_id=int(interaction.channel.id),
                 creator_id=int(interaction.user.id),
                 title=title,
                 game_key=game or "lol",
+                assignment_mode=_choice_value(assignment_mode, "BALANCED"),
+                preferred_role_1=_choice_value(preferred_role_1),
+                preferred_role_2=_choice_value(preferred_role_2),
+                preferred_role_3=_choice_value(preferred_role_3),
+                voice_category_id=voice_category_id,
                 **({} if recruitment_minutes is None else {"recruitment_minutes": int(recruitment_minutes)}),
             )
             match_id = int(_get(created, "id"))
@@ -153,7 +211,11 @@ class MatchCommandGroup(app_commands.Group):
                         logger.exception("전송된 내전 메시지 취소 표시 실패", extra={"match_id": match_id})
                 await self._send(interaction, "내전 메시지 처리에 실패해 내전을 취소했습니다.")
                 return
-            await self._send(interaction, "내전을 생성했습니다.")
+            await self._send(
+                interaction,
+                "내전을 생성했습니다."
+                + (f" 보이스 자동 생성은 사용하지 않습니다: {voice_category_error}" if voice_category_error else ""),
+            )
         except MatchError as exc:
             await self._send(interaction, str(exc) or "이 채널에 활성 내전이 이미 있습니다.")
         except Exception:
@@ -220,6 +282,35 @@ class MatchCommandGroup(app_commands.Group):
             embed.add_field(name="승리", value=f"{wins}승", inline=True)
             embed.add_field(name="패배", value=f"{losses}패", inline=True)
             embed.add_field(name="승률", value=f"{rate * 100:.1f}%" if games else "0%", inline=False)
+            role_stats = tuple(_get(stats, "role_stats", ()) or ())
+            if role_stats:
+                embed.add_field(
+                    name="평균 라인 MMR",
+                    value=f"{int(_get(stats, 'average_role_rating', 0))}점",
+                    inline=False,
+                )
+                for role_stat in role_stats:
+                    role = str(_get(role_stat, "role"))
+                    placed = bool(_get(role_stat, "placed", False))
+                    rating = int(_get(role_stat, "rating", 0))
+                    role_games = int(_get(role_stat, "games", 0))
+                    role_wins = int(_get(role_stat, "wins", 0))
+                    role_losses = int(_get(role_stat, "losses", 0))
+                    role_rate = float(_get(role_stat, "rate", 0.0))
+                    rating_text = f"{rating}점" if placed else "0점 · 배치 전"
+                    embed.add_field(
+                        name=ROLE_LABELS.get(role, role),
+                        value=(
+                            f"{rating_text}\n{role_games}경기 {role_wins}승 "
+                            f"{role_losses}패 · {role_rate * 100:.1f}%"
+                        ),
+                        inline=True,
+                    )
+                embed.add_field(
+                    name="최고 라인 MMR",
+                    value=f"{int(_get(stats, 'highest_role_rating', 0))}점",
+                    inline=False,
+                )
             await self._send_embed(interaction, embed)
         except MatchError as exc:
             await self._send(interaction, str(exc) or "전적을 조회할 수 없습니다.")
@@ -286,13 +377,15 @@ class MatchCommandGroup(app_commands.Group):
             await self._send(interaction, "시즌 종료 중 오류가 발생했습니다.")
 
     @app_commands.command(name="랭킹", description="시즌 MMR 랭킹을 확인합니다.")
-    @app_commands.describe(game="게임", season="시즌 ID", limit="표시 인원수")
-    @app_commands.rename(game="게임", season="시즌", limit="인원수")
+    @app_commands.describe(game="게임", season="시즌 ID", role="라인", limit="표시 인원수")
+    @app_commands.rename(game="게임", season="시즌", role="라인", limit="인원수")
+    @app_commands.choices(role=ROLE_CHOICES)
     async def ranking(
         self,
         interaction: discord.Interaction,
         game: str | None = None,
         season: int | None = None,
+        role: app_commands.Choice[str] | None = None,
         limit: app_commands.Range[int, 1, 25] = 10,
     ) -> None:
         if interaction.guild is None:
@@ -304,9 +397,12 @@ class MatchCommandGroup(app_commands.Group):
                 int(interaction.guild.id),
                 game_key=game or "lol",
                 season_id=season,
+                role=_choice_value(role),
                 limit=int(limit),
             )
-            embed = discord.Embed(title="내전 MMR 랭킹", colour=0x5865F2)
+            role_value = _choice_value(role)
+            title = f"{ROLE_LABELS.get(role_value, role_value)} MMR 랭킹" if role_value else "평균 라인 MMR 랭킹"
+            embed = discord.Embed(title=title, colour=0x5865F2)
             if entries:
                 lines = [
                     f"{index}. <@{int(_get(entry, 'user_id'))}> · "
@@ -322,6 +418,126 @@ class MatchCommandGroup(app_commands.Group):
         except Exception:
             logger.exception("내전 랭킹 조회 실패")
             await self._send(interaction, "랭킹 조회 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="라인변경", description="참가 중인 내전의 지망 라인을 바꿉니다.")
+    @app_commands.describe(first="1지망", second="2지망", third="3지망")
+    @app_commands.rename(first="1지망", second="2지망", third="3지망")
+    @app_commands.choices(first=ROLE_CHOICES, second=ROLE_CHOICES, third=ROLE_CHOICES)
+    async def change_roles(
+        self,
+        interaction: discord.Interaction,
+        first: app_commands.Choice[str],
+        second: app_commands.Choice[str],
+        third: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if interaction.guild is None or interaction.channel is None:
+            await self._send(interaction, "서버 채널에서만 사용할 수 있습니다.")
+            return
+        await self._defer(interaction)
+        try:
+            active = await self._active_for_channel(
+                int(interaction.guild.id), int(interaction.channel.id)
+            )
+            if active is None:
+                await self._send(interaction, "이 채널에 활성 내전이 없습니다.")
+                return
+            match_id = int(_get(active, "id"))
+            await self.service.update_preferences(
+                match_id, int(interaction.user.id),
+                _choice_value(first), _choice_value(second), _choice_value(third),
+            )
+            await self._refresh_message(interaction, match_id)
+            await self._send(interaction, "지망 라인을 변경했습니다.")
+        except MatchError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("라인 변경 실패")
+            await self._send(interaction, "라인 변경 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="mmr설정", description="현재 시즌의 라인 MMR을 설정합니다.")
+    @app_commands.describe(
+        user="설정할 사용자", role="라인", tier="티어", detail="세부 단계",
+        rating="직접 지정할 점수", game="게임",
+    )
+    @app_commands.rename(
+        user="사용자", role="라인", tier="티어", detail="세부단계",
+        rating="점수", game="게임",
+    )
+    @app_commands.choices(role=ROLE_CHOICES, tier=TIER_CHOICES)
+    async def set_mmr(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        role: app_commands.Choice[str],
+        tier: app_commands.Choice[str] | None = None,
+        detail: str | None = None,
+        rating: app_commands.Range[int, 0, 10000] | None = None,
+        game: str | None = None,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        if not self._manage_guild(interaction):
+            await self._send(interaction, "서버 관리 권한이 필요합니다.")
+            return
+        if tier is None and rating is None:
+            await self._send(interaction, "티어 또는 직접 지정 점수가 필요합니다.")
+            return
+        await self._defer(interaction)
+        try:
+            value = await self.service.set_role_rating(
+                int(interaction.guild.id), int(user.id), _choice_value(role),
+                game_key=game or "lol", tier=_choice_value(tier), detail=detail,
+                rating=int(rating) if rating is not None else None,
+                manage_guild=True,
+            )
+            await self._send(
+                interaction,
+                f"<@{int(user.id)}> {ROLE_LABELS.get(_choice_value(role), _choice_value(role))} MMR을 {value}점으로 설정했습니다.",
+            )
+        except MatchError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("라인 MMR 설정 실패")
+            await self._send(interaction, "라인 MMR 설정 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="지명", description="Draft에서 현재 차례의 사용자를 지명합니다.")
+    @app_commands.describe(user="지명할 사용자")
+    @app_commands.rename(user="사용자")
+    async def draft_pick(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        if interaction.guild is None or interaction.channel is None:
+            await self._send(interaction, "서버 채널에서만 사용할 수 있습니다.")
+            return
+        await self._defer(interaction)
+        try:
+            active = await self._active_for_channel(
+                int(interaction.guild.id), int(interaction.channel.id)
+            )
+            if active is None:
+                await self._send(interaction, "이 채널에 활성 내전이 없습니다.")
+                return
+            match_id = int(_get(active, "id"))
+            result = await self.service.draft_pick(
+                match_id, int(interaction.user.id), int(user.id)
+            )
+            await self._refresh_message(interaction, match_id)
+            if bool(_get(result, "started", False)):
+                voice_summary = await ensure_match_voice_channels(
+                    self.service, interaction.guild, result,
+                    self.team_a_voice_channel_id, self.team_b_voice_channel_id,
+                )
+                await self._refresh_message(interaction, match_id)
+                text = "지명이 끝나 내전을 시작했습니다."
+                if voice_summary.error:
+                    text += f" 보이스 처리 실패: {voice_summary.error} 경기와 팀 배정은 저장됐습니다."
+                await self._send(interaction, text)
+            else:
+                await self._send(interaction, f"<@{int(user.id)}>님을 지명했습니다.")
+        except MatchError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("Draft 지명 실패")
+            await self._send(interaction, "지명 처리 중 오류가 발생했습니다.")
 
     @app_commands.command(name="결과", description="진행 중인 내전의 결과를 기록합니다.")
     @app_commands.describe(winner_team="승리 팀", memo="선택 메모")
@@ -348,7 +564,7 @@ class MatchCommandGroup(app_commands.Group):
                 await self._send(interaction, "이 채널에 활성 내전이 없습니다.")
                 return
             match_id = int(_get(active, "id"))
-            await self.service.finish_match(
+            finished = await self.service.finish_match(
                 match_id,
                 int(interaction.user.id),
                 getattr(winner_team, "value", winner_team),
@@ -356,7 +572,11 @@ class MatchCommandGroup(app_commands.Group):
                 manage_guild=self._manage_guild(interaction),
             )
             await self._refresh_message(interaction, match_id)
-            await self._send(interaction, "내전 결과를 기록했습니다.")
+            text = "내전 결과를 기록했습니다."
+            if _get(finished, "voice_cleanup_at") is not None:
+                delay = int(getattr(self.service, "voice_cleanup_delay_seconds", 600))
+                text += f" 보이스 채널은 {delay // 60}분 후 삭제됩니다."
+            await self._send(interaction, text)
         except MatchError as exc:
             await self._send(interaction, str(exc) or "내전 결과를 기록할 수 없습니다.")
         except Exception:
@@ -368,6 +588,7 @@ class MatchCommandGroup(app_commands.Group):
     @season_start.autocomplete("game")
     @season_end.autocomplete("game")
     @ranking.autocomplete("game")
+    @set_mmr.autocomplete("game")
     async def game_autocomplete(
         self,
         interaction: discord.Interaction,
@@ -443,6 +664,7 @@ def add_match_commands(
     *,
     team_a_voice_channel_id: int | None = None,
     team_b_voice_channel_id: int | None = None,
+    inhouse_voice_category_id: int | None = None,
 ) -> MatchCommandGroup:
     """길드 하나에 명령 그룹을 등록한다."""
 
@@ -450,6 +672,7 @@ def add_match_commands(
         service,
         team_a_voice_channel_id=team_a_voice_channel_id,
         team_b_voice_channel_id=team_b_voice_channel_id,
+        inhouse_voice_category_id=inhouse_voice_category_id,
     )
     tree.add_command(group, guild=discord.Object(id=int(guild_id)))
     return group

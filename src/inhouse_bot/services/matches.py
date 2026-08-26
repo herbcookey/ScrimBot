@@ -8,16 +8,21 @@ from typing import Any
 from inhouse_bot.repositories.matches import (
     ACTIVE_STATUSES,
     ActiveMatchExistsError,
+    ActiveMembershipError,
     AlreadyJoinedError,
     CANCELLED,
+    DRAFTING,
     FINISHED,
     Game,
     GameNotFoundError,
+    InvalidAssignmentModeError,
     InvalidCapacityError,
+    InvalidDraftPickError,
     InvalidMatchStateError,
     InvalidRecruitmentMinutesError,
     InvalidTimeoutError,
     InvalidWinnerTeamError,
+    InvalidRolePreferencesError,
     Match,
     MatchError,
     MatchEvent,
@@ -26,13 +31,16 @@ from inhouse_bot.repositories.matches import (
     MatchRepository,
     MatchResult,
     MatchStats,
+    RoleAssignmentImpossibleError,
     RankingEntry,
+    RoleStats,
     NotParticipantError,
     Participant,
     PermissionDeniedError,
     ResultAlreadyRecordedError,
     Season,
     SeasonNotFoundError,
+    UnplacedRoleError,
     InvalidRankingLimitError,
     InvalidSeasonStateError,
     calculate_rating_delta,
@@ -49,11 +57,13 @@ class MatchService:
         ready_timeout_seconds: int = 120,
         default_recruitment_minutes: int = 30,
         reminder_before_seconds: int = 300,
+        voice_cleanup_delay_seconds: int = 600,
     ) -> None:
         self.repository = MatchRepository(pool)
         self.ready_timeout_seconds = int(ready_timeout_seconds)
         self.default_recruitment_minutes = int(default_recruitment_minutes)
         self.reminder_before_seconds = int(reminder_before_seconds)
+        self.voice_cleanup_delay_seconds = int(voice_cleanup_delay_seconds)
 
     async def create_match(
         self,
@@ -63,6 +73,11 @@ class MatchService:
         title: str,
         *,
         game_key: str = "lol",
+        assignment_mode: str = "BALANCED",
+        preferred_role_1: str | None = None,
+        preferred_role_2: str | None = None,
+        preferred_role_3: str | None = None,
+        voice_category_id: int | None = None,
         capacity: int | None = None,
         recruitment_minutes: int | None = None,
         now: datetime | None = None,
@@ -73,6 +88,11 @@ class MatchService:
             creator_id,
             title,
             game_key=game_key,
+            assignment_mode=assignment_mode,
+            preferred_role_1=preferred_role_1,
+            preferred_role_2=preferred_role_2,
+            preferred_role_3=preferred_role_3,
+            voice_category_id=voice_category_id,
             capacity=capacity,
             recruitment_minutes=(
                 self.default_recruitment_minutes
@@ -82,10 +102,39 @@ class MatchService:
             now=now,
         )
 
-    async def join_match(self, match_id: int, user_id: int, *, now: datetime | None = None) -> Match:
+    async def join_match(
+        self,
+        match_id: int,
+        user_id: int,
+        *,
+        preferred_role_1: str | None = None,
+        preferred_role_2: str | None = None,
+        preferred_role_3: str | None = None,
+        now: datetime | None = None,
+    ) -> Match:
         return await self.repository.join_match(
             match_id,
             user_id,
+            preferred_role_1=preferred_role_1,
+            preferred_role_2=preferred_role_2,
+            preferred_role_3=preferred_role_3,
+            now=now,
+            ready_timeout_seconds=self.ready_timeout_seconds,
+            default_recruitment_minutes=self.default_recruitment_minutes,
+        )
+
+    async def update_preferences(
+        self,
+        match_id: int,
+        user_id: int,
+        preferred_role_1: str,
+        preferred_role_2: str,
+        preferred_role_3: str | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> Match:
+        return await self.repository.update_preferences(
+            match_id, user_id, preferred_role_1, preferred_role_2, preferred_role_3,
             now=now,
             ready_timeout_seconds=self.ready_timeout_seconds,
             default_recruitment_minutes=self.default_recruitment_minutes,
@@ -134,6 +183,13 @@ class MatchService:
     async def toggle_ready(self, match_id: int, user_id: int, *, now: datetime | None = None) -> Match:
         return await self.repository.toggle_ready(match_id, user_id, now=now)
 
+    async def draft_pick(
+        self, match_id: int, actor_id: int, target_user_id: int, *, now: datetime | None = None
+    ) -> Match:
+        return await self.repository.draft_pick(
+            match_id, actor_id, target_user_id, now=now
+        )
+
     async def kick_match_member(
         self,
         match_id: int,
@@ -168,6 +224,7 @@ class MatchService:
             manage_guild=manage_guild,
             reason=reason,
             now=now,
+            voice_cleanup_delay_seconds=self.voice_cleanup_delay_seconds,
         )
 
     async def finish_match(
@@ -187,6 +244,7 @@ class MatchService:
             memo,
             manage_guild=manage_guild,
             now=now,
+            voice_cleanup_delay_seconds=self.voice_cleanup_delay_seconds,
         )
 
     async def stats(
@@ -203,6 +261,24 @@ class MatchService:
 
     async def list_games(self) -> list[Game]:
         return await self.repository.list_games()
+
+    async def set_role_rating(
+        self,
+        guild_id: int,
+        user_id: int,
+        role: str,
+        *,
+        game_key: str = "lol",
+        tier: str | None = None,
+        detail: str | int | None = None,
+        rating: int | None = None,
+        manage_guild: bool = False,
+        now: datetime | None = None,
+    ) -> int:
+        return await self.repository.set_role_rating(
+            guild_id, user_id, role, game_key=game_key, tier=tier,
+            detail=detail, rating=rating, manage_guild=manage_guild, now=now,
+        )
 
     async def list_seasons(self, guild_id: int, game_key: str = "lol") -> list[Season]:
         return await self.repository.list_seasons(guild_id, game_key)
@@ -238,10 +314,11 @@ class MatchService:
         *,
         game_key: str = "lol",
         season_id: int | None = None,
+        role: str | None = None,
         limit: int = 10,
     ) -> list[RankingEntry]:
         return await self.repository.ranking(
-            guild_id, game_key=game_key, season_id=season_id, limit=limit
+            guild_id, game_key=game_key, season_id=season_id, role=role, limit=limit
         )
 
     async def process_due_matches(self, now: datetime | None = None) -> list[MatchEvent]:
@@ -261,27 +338,60 @@ class MatchService:
     async def list_active(self, guild_id: int | None = None) -> list[Match]:
         return await self.repository.list_active(guild_id)
 
+    async def set_voice_channel_id(
+        self, match_id: int, team: str, channel_id: int, *, replace_missing: bool = False
+    ) -> Match:
+        return await self.repository.set_voice_channel_id(
+            match_id, team, channel_id, replace_missing=replace_missing
+        )
+
+    async def list_due_voice_cleanups(self, now: datetime | None = None) -> list[Match]:
+        return await self.repository.list_due_voice_cleanups(now)
+
+    async def record_voice_cleanup(
+        self,
+        match_id: int,
+        *,
+        clear_team_a: bool,
+        clear_team_b: bool,
+        retry_at: datetime | None,
+    ) -> Match:
+        return await self.repository.record_voice_cleanup(
+            match_id,
+            clear_team_a=clear_team_a,
+            clear_team_b=clear_team_b,
+            retry_at=retry_at,
+        )
+
     async def update_message_id(self, match_id: int, message_id: int | None) -> Match:
         return await self.repository.update_message_id(match_id, message_id)
 
     async def cancel_missing_message(self, match_id: int) -> Match:
-        return await self.repository.cancel_missing_message(match_id)
+        return await self.repository.cancel_missing_message(
+            match_id,
+            voice_cleanup_delay_seconds=self.voice_cleanup_delay_seconds,
+        )
 
 
 
 __all__ = [
     "ACTIVE_STATUSES",
     "ActiveMatchExistsError",
+    "ActiveMembershipError",
     "AlreadyJoinedError",
     "CANCELLED",
+    "DRAFTING",
     "FINISHED",
     "Game",
     "GameNotFoundError",
+    "InvalidAssignmentModeError",
     "InvalidCapacityError",
+    "InvalidDraftPickError",
     "InvalidMatchStateError",
     "InvalidRecruitmentMinutesError",
     "InvalidTimeoutError",
     "InvalidWinnerTeamError",
+    "InvalidRolePreferencesError",
     "InvalidRankingLimitError",
     "InvalidSeasonStateError",
     "Match",
@@ -293,12 +403,15 @@ __all__ = [
     "MatchResult",
     "MatchService",
     "MatchStats",
+    "RoleAssignmentImpossibleError",
     "RankingEntry",
+    "RoleStats",
     "NotParticipantError",
     "Participant",
     "PermissionDeniedError",
     "ResultAlreadyRecordedError",
     "Season",
     "SeasonNotFoundError",
+    "UnplacedRoleError",
     "calculate_rating_delta",
 ]

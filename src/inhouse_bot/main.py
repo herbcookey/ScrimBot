@@ -15,6 +15,7 @@ from .db import close_pool, create_pool
 from .discord.commands import add_match_commands
 from .discord.renderer import render_match
 from .discord.views import MatchView, SAFE_MENTIONS
+from .discord.voice import cleanup_match_voice_channels, ensure_match_voice_channels
 from .services.matches import MatchService
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,7 @@ class InhouseBot(commands.Bot):
                 ready_timeout_seconds=self.settings.ready_timeout_seconds,
                 default_recruitment_minutes=self.settings.default_recruitment_minutes,
                 reminder_before_seconds=self.settings.reminder_before_seconds,
+                voice_cleanup_delay_seconds=self.settings.voice_cleanup_delay_seconds,
             )
         add_match_commands(
             self.tree,
@@ -80,13 +82,14 @@ class InhouseBot(commands.Bot):
             self.settings.discord_guild_id,
             team_a_voice_channel_id=self.settings.team_a_voice_channel_id,
             team_b_voice_channel_id=self.settings.team_b_voice_channel_id,
+            inhouse_voice_category_id=self.settings.inhouse_voice_category_id,
         )
         guild = discord.Object(id=self.settings.discord_guild_id)
         await self.tree.sync(guild=guild)
         logger.info("길드 명령 동기화 완료", extra={"guild_id": self.settings.discord_guild_id})
 
     async def on_ready(self) -> None:
-        logger.info("Discord 로그인: %s", self.user)
+        logger.info("디스코드 로그인: %s", self.user)
         await self.recover_active_matches()
         self._ensure_poll_task()
 
@@ -120,7 +123,18 @@ class InhouseBot(commands.Bot):
                 await self._handle_due_event(event)
             except Exception:
                 logger.exception("만료 내전 알림 전송 실패", extra={"match_id": _get(event, "match_id")})
+        await self.process_voice_cleanups()
         return events
+
+    async def process_voice_cleanups(self) -> None:
+        if self.service is None:
+            return
+        for match in await self.service.list_due_voice_cleanups():
+            guild = self.get_guild(int(_get(match, "guild_id")))
+            try:
+                await cleanup_match_voice_channels(self.service, guild, match)
+            except Exception:
+                logger.exception("내전 보이스 정리 처리 실패", extra={"match_id": _get(match, "id")})
 
     async def _channel_for(self, channel_id: int) -> Any | None:
         channel = self.get_channel(int(channel_id))
@@ -218,6 +232,30 @@ class InhouseBot(commands.Bot):
                 for match in matches:
                     match_id = int(_get(match, "id"))
                     status = str(_get(match, "status", ""))
+                    if status == "PLAYING":
+                        guild = self.get_guild(int(_get(match, "guild_id")))
+                        if guild is not None:
+                            summary = await ensure_match_voice_channels(
+                                self.service,
+                                guild,
+                                match,
+                                self.settings.team_a_voice_channel_id,
+                                self.settings.team_b_voice_channel_id,
+                            )
+                            if summary.error:
+                                logger.error(
+                                    "진행 중 내전 보이스 복구 실패: %s",
+                                    summary.error,
+                                    extra={"match_id": match_id},
+                                )
+                                text_channel = await self._channel_for(int(_get(match, "channel_id")))
+                                if text_channel is not None:
+                                    await _safe_send(
+                                        text_channel,
+                                        f"<@{int(_get(match, 'creator_id'))}> 보이스 복구 실패: "
+                                        f"{summary.error} 경기와 팀 배정은 DB에 저장되어 있습니다.",
+                                    )
+                            match = await self.service.get_match(match_id) or match
                     view = MatchView(
                         self.service,
                         match_id,

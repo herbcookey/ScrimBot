@@ -3,14 +3,22 @@
 from .renderer import render_match
 from .views import MatchView
 from .voice import (
+    VoiceCleanupSummary,
     VoiceMoveSummary,
+    cleanup_match_voice_channels,
+    ensure_match_voice_channels,
+    match_voice_channel_name,
     move_match_participants,
     voice_move_plan,
 )
 
 __all__ = [
     "MatchView",
+    "VoiceCleanupSummary",
     "VoiceMoveSummary",
+    "cleanup_match_voice_channels",
+    "ensure_match_voice_channels",
+    "match_voice_channel_name",
     "move_match_participants",
     "render_match",
     "voice_move_plan",

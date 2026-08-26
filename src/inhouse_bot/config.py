@@ -14,6 +14,8 @@ class Settings:
     ready_timeout_seconds: int = 120
     default_recruitment_minutes: int = 30
     reminder_before_seconds: int = 300
+    voice_cleanup_delay_seconds: int = 600
+    inhouse_voice_category_id: int | None = None
     team_a_voice_channel_id: int | None = None
     team_b_voice_channel_id: int | None = None
 
@@ -40,6 +42,8 @@ def load_settings() -> Settings:
         "DEFAULT_RECRUITMENT_MINUTES", 30, minimum=5, maximum=1440
     )
     reminder_before_seconds = _positive_int("REMINDER_BEFORE_SECONDS", 300)
+    voice_cleanup_delay_seconds = _non_negative_int("VOICE_CLEANUP_DELAY_SECONDS", 600)
+    inhouse_voice_category_id = _optional_int("INHOUSE_VOICE_CATEGORY_ID")
     team_a_voice_channel_id = _optional_int("TEAM_A_VOICE_CHANNEL_ID")
     team_b_voice_channel_id = _optional_int("TEAM_B_VOICE_CHANNEL_ID")
     if team_a_voice_channel_id is not None and team_a_voice_channel_id == team_b_voice_channel_id:
@@ -54,6 +58,8 @@ def load_settings() -> Settings:
         ready_timeout_seconds=ready_timeout_seconds,
         default_recruitment_minutes=default_recruitment_minutes,
         reminder_before_seconds=reminder_before_seconds,
+        voice_cleanup_delay_seconds=voice_cleanup_delay_seconds,
+        inhouse_voice_category_id=inhouse_voice_category_id,
         team_a_voice_channel_id=team_a_voice_channel_id,
         team_b_voice_channel_id=team_b_voice_channel_id,
     )
@@ -76,6 +82,19 @@ def _bounded_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     parsed = _positive_int(name, default)
     if not minimum <= parsed <= maximum:
         raise RuntimeError(f"{name}은 {minimum}에서 {maximum} 사이여야 합니다")
+    return parsed
+
+
+def _non_negative_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name}은 0 이상의 정수여야 합니다") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name}은 0 이상의 정수여야 합니다")
     return parsed
 
 

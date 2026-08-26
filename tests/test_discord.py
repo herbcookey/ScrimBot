@@ -22,6 +22,21 @@ def _participant(user_id, *, ready=False, team=None):
     )
 
 
+def _role_participant(user_id, *, team=None, role=None, rating=None, preferences=("TOP", "MID")):
+    return SimpleNamespace(
+        user_id=user_id,
+        ready_at=None,
+        team=team,
+        assigned_role=role,
+        role_rating_snapshot=rating,
+        preferred_role_1=preferences[0],
+        preferred_role_2=preferences[1],
+        preferred_role_3=None,
+        preferences=preferences,
+        average_role_rating=1500,
+    )
+
+
 def test_renderer_ready_waitlist_and_deadlines():
     deadline = datetime(2030, 1, 1, tzinfo=timezone.utc)
     match = SimpleNamespace(
@@ -78,6 +93,74 @@ def test_match_view_ids_and_disabled_state():
     assert playing.ready_button.disabled
     assert not playing.cancel_button.disabled
 
+    drafting = MatchView(object(), 42, status="DRAFTING")
+    assert drafting.cancel_button.disabled is False
+    assert all(
+        item.disabled for item in (
+            drafting.join_button, drafting.leave_button,
+            drafting.start_button, drafting.ready_button,
+        )
+    )
+
+
+def test_renderer_drafting_and_assigned_roles():
+    drafting = SimpleNamespace(
+        status="DRAFTING", title="지명 테스트", capacity=10, creator_id=1,
+        role_rating_enabled=True, captain_a_id=1, captain_b_id=2,
+        draft_pick_index=0,
+        participants=(
+            _role_participant(1, team="A"),
+            _role_participant(2, team="B"),
+            _role_participant(3),
+        ),
+        waitlist=(),
+    )
+    fields = _fields(render_match(drafting))
+    assert fields["상태"] == "주장 지명"
+    assert "A팀 <@1>" == fields["현재 지명"]
+    assert "탑/미드" in fields["미지명"] and "1500점" in fields["미지명"]
+
+    playing = SimpleNamespace(
+        status="PLAYING", title="라인 테스트", capacity=2, creator_id=1,
+        role_rating_enabled=True,
+        voice_category_id=10,
+        team_a_voice_channel_id=20,
+        team_b_voice_channel_id=21,
+        participants=(
+            _role_participant(1, team="A", role="TOP", rating=1680),
+            _role_participant(2, team="B", role="TOP", rating=1922),
+        ),
+        waitlist=(),
+    )
+    fields = _fields(render_match(playing))
+    assert "탑 1680점" in fields["A팀"]
+    assert "탑 1922점" in fields["B팀"]
+    assert fields["1팀 보이스"] == "<#20>"
+    assert fields["2팀 보이스"] == "<#21>"
+
+    playing.team_b_voice_channel_id = None
+    fields = _fields(render_match(playing))
+    assert fields["보이스"] == "보이스 채널 생성 실패"
+
+
+@pytest.mark.asyncio
+async def test_role_join_button_opens_modal_before_defer():
+    from inhouse_bot.discord.views import JoinPreferencesModal, MatchView
+
+    service = SimpleNamespace(
+        get_match=AsyncMock(return_value=SimpleNamespace(role_rating_enabled=True))
+    )
+    view = MatchView(service, 42, status="RECRUITING")
+    response = SimpleNamespace(send_modal=AsyncMock(), send_message=AsyncMock())
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=7), response=response, message=object()
+    )
+    await view._join(interaction)
+    modal = response.send_modal.await_args.args[0]
+    assert isinstance(modal, JoinPreferencesModal)
+    assert modal.custom_id == "match:42:join_roles"
+    assert modal.first.required and modal.second.required and not modal.third.required
+
 
 def test_create_command_recruitment_minutes_is_optional():
     from inhouse_bot.discord.commands import MatchCommandGroup
@@ -100,6 +183,18 @@ def test_phase3a_command_options_are_optional_and_bounded():
     assert limit.default == 10 and limit.min_value == 1 and limit.max_value == 25
 
 
+def test_phase3b_command_options_and_names():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    mode = MatchCommandGroup.create._params["assignment_mode"]
+    assert mode.required is False and mode.default is None
+    assert MatchCommandGroup.create._params["preferred_role_1"].required is False
+    assert MatchCommandGroup.create._params["preferred_role_2"].required is False
+    assert MatchCommandGroup.ranking._params["role"].required is False
+    assert MatchCommandGroup.set_mmr.name == "mmr설정"
+    assert MatchCommandGroup.set_mmr._params["game"].autocomplete is not None
+
+
 def test_load_settings_rejects_duplicate_voice_channels(monkeypatch):
     from inhouse_bot.config import load_settings
 
@@ -109,6 +204,19 @@ def test_load_settings_rejects_duplicate_voice_channels(monkeypatch):
     monkeypatch.setenv("TEAM_A_VOICE_CHANNEL_ID", "42")
     monkeypatch.setenv("TEAM_B_VOICE_CHANNEL_ID", "42")
     with pytest.raises(RuntimeError, match="달라야 합니다"):
+        load_settings()
+
+
+def test_voice_cleanup_delay_allows_zero_and_rejects_negative(monkeypatch):
+    from inhouse_bot.config import load_settings
+
+    monkeypatch.setenv("DISCORD_TOKEN", "token")
+    monkeypatch.setenv("DISCORD_GUILD_ID", "1")
+    monkeypatch.setenv("DATABASE_URL", "postgres://localhost/test")
+    monkeypatch.setenv("VOICE_CLEANUP_DELAY_SECONDS", "0")
+    assert load_settings().voice_cleanup_delay_seconds == 0
+    monkeypatch.setenv("VOICE_CLEANUP_DELAY_SECONDS", "-1")
+    with pytest.raises(RuntimeError, match="0 이상의 정수"):
         load_settings()
 
 
