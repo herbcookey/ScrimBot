@@ -88,13 +88,22 @@ def render_match(match: Any) -> discord.Embed:
     """DB 최신 상태로 화면을 만든다. 기준은 Discord가 아니라 DB다."""
 
     status = str(_get(match, "status", "RECRUITING"))
-    title = str(_get(match, "title", "LoL 5:5 내전"))
+    game_name = str(_get(match, "game_name", "League of Legends"))
+    team_size = int(_get(match, "team_size", 5))
+    title = str(_get(match, "title", f"{game_name} 내전"))
     capacity = int(_get(match, "capacity", 10))
     players = _participants(match)
     waiting = _waitlist(match)
-    embed = discord.Embed(title="[LoL 5:5 내전]", description=title, colour=0x5865F2)
+    embed = discord.Embed(
+        title=f"[{game_name} {team_size}:{team_size} 내전]",
+        description=title,
+        colour=0x5865F2,
+    )
     embed.add_field(name="상태", value=_STATUS_LABELS.get(status, status), inline=True)
     embed.add_field(name="참가자", value=f"{len(players)} / {capacity}", inline=True)
+    season_name = _get(match, "season_name")
+    if season_name:
+        embed.add_field(name="시즌", value=str(season_name), inline=True)
     if waiting:
         embed.add_field(name="대기자", value=f"{len(waiting)}명\n{_roster(waiting)}", inline=True)
 
@@ -116,18 +125,18 @@ def render_match(match: Any) -> discord.Embed:
     elif status == "PLAYING":
         for team in ("A", "B"):
             members = [item for item in players if _participant_team(item) == team]
-            embed.add_field(name=f"Team {team}", value=_roster(members), inline=True)
+            embed.add_field(name=f"{team}팀", value=_roster(members), inline=True)
     elif status == "FINISHED":
         result = _get(match, "result")
         winner = _get(result, "winner_team") if result is not None else None
         if winner:
-            embed.add_field(name="승리팀", value=f"Team {winner}", inline=True)
+            embed.add_field(name="승리팀", value=f"{winner}팀", inline=True)
         memo = _get(result, "memo") if result is not None else None
         if memo:
             embed.add_field(name="메모", value=str(memo), inline=False)
         for team in ("A", "B"):
             members = [item for item in players if _participant_team(item) == team]
-            embed.add_field(name=f"Team {team}", value=_roster(members), inline=True)
+            embed.add_field(name=f"{team}팀", value=_roster(members), inline=True)
     elif status == "CANCELLED":
         reason = _get(match, "cancel_reason") or "사유 없음"
         embed.add_field(name="취소 사유", value=str(reason), inline=False)

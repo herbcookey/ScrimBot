@@ -1,6 +1,6 @@
-# LoL 5:5 내전 봇 MVP
+# Discord 내전 봇 MVP
 
-Discord에서 League of Legends 5:5 내전을 모집하고 팀을 배정하는 봇입니다. 모집 상태와 참가자·팀·결과는 Supabase PostgreSQL에 저장하고, Discord 메시지는 그 상태를 보여 주는 UI로만 사용합니다.
+Discord에서 게임 내전을 모집하고 팀을 배정하는 봇입니다. 기본 게임은 LoL 5:5입니다. 모집 상태와 참가자·팀·결과는 Supabase PostgreSQL에 저장하고, Discord 메시지는 그 상태를 보여 주는 UI로만 사용합니다.
 
 ## 요구 사항
 
@@ -22,12 +22,15 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 
 길드 전용 `/내전` 그룹을 사용합니다.
 
-- `/내전 생성 제목`: 현재 채널에 모집 패널을 만듭니다.
+- `/내전 생성 제목 [게임]`: 현재 채널에 모집 패널을 만듭니다. 게임을 빼면 기존처럼 LoL입니다.
 - `/내전 생성`에는 선택적인 `모집시간`(분)을 지정할 수 있습니다. 기본값은 30분이며 5~1440분입니다.
 - 패널의 `참가`, `나가기`, `팀 배정·시작`, `내전 취소` 버튼으로 모집을 관리합니다.
 - `/내전 결과 승리팀 [메모]`: 진행 중인 내전 결과를 기록합니다.
 - `/내전 강퇴 사용자:@사용자`: 현재 채널의 모집 중 내전에서 참가자 또는 대기자를 강퇴합니다.
-- `/내전 전적 [사용자:@사용자]`: 현재 서버의 종료 경기 전적과 승률을 조회합니다.
+- `/내전 전적 [사용자:@사용자] [게임] [시즌]`: 현재 서버의 종료 경기 전적과 승률을 조회합니다.
+- `/내전 시즌시작 이름 [게임]`: 서버 관리 권한으로 새 시즌을 시작합니다. 기존 활성 시즌은 같이 종료됩니다.
+- `/내전 시즌종료 [게임]`: 현재 활성 시즌을 종료합니다.
+- `/내전 랭킹 [게임] [시즌] [인원수]`: 시즌 MMR 순위를 조회합니다. 기본 10명, 최대 25명입니다.
 
 ## 환경 변수
 
@@ -38,11 +41,12 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 | `DISCORD_TOKEN` | Discord Bot 토큰. 저장소·로그·README에 남기지 않습니다. |
 | `DISCORD_GUILD_ID` | 슬래시 명령을 동기화할 Discord 서버 ID(정수). |
 | `DATABASE_URL` | 앱이 사용할 PostgreSQL 연결 문자열. |
+| `TEST_DATABASE_URL` | PostgreSQL 통합 테스트 전용 연결 문자열. 앱 실행에는 쓰지 않습니다. |
 | `READY_TIMEOUT_SECONDS` | 준비 확인 제한 시간(초). 기본값 `120`. |
 | `DEFAULT_RECRUITMENT_MINUTES` | `/내전 생성` 모집시간 기본값(분, 5~1440). 기본값 `30`. |
 | `REMINDER_BEFORE_SECONDS` | 모집 마감 전 채널 알림 시점(초). 기본값 `300`(5분). |
-| `TEAM_A_VOICE_CHANNEL_ID` | 기존 Team A 음성 채널 ID. B와 함께 설정할 때만 자동 배치 활성화. 기본값 빈 값(비활성). |
-| `TEAM_B_VOICE_CHANNEL_ID` | 기존 Team B 음성 채널 ID. A와 함께 설정할 때만 자동 배치 활성화. 기본값 빈 값(비활성). |
+| `TEAM_A_VOICE_CHANNEL_ID` | 기존 A팀 음성 채널 ID. B와 함께 설정할 때만 자동 배치 활성화. 기본값 빈 값(비활성). |
+| `TEAM_B_VOICE_CHANNEL_ID` | 기존 B팀 음성 채널 ID. A와 함께 설정할 때만 자동 배치 활성화. 기본값 빈 값(비활성). |
 
 실제 토큰이나 데이터베이스 비밀번호가 들어간 `.env`를 커밋하거나 채팅에 붙여넣지 마세요. 이미 노출했다면 Discord 토큰을 재발급하고 DB 비밀번호를 회전해야 합니다.
 
@@ -50,11 +54,34 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 
 상태는 PostgreSQL이 관리하며 `RECRUITING → READY_CHECK → PLAYING → FINISHED` 순서로 진행합니다. 모집·준비·진행 중에는 생성자 또는 `Manage Guild` 권한 사용자가 취소할 수 있고, 허용되지 않은 역방향 전이는 하지 않습니다. 준비 확인 중 참가자가 빠져 정원이 부족해진 경우에만 다시 `RECRUITING`으로 돌아갑니다.
 
-- 기존 `팀 배정·시작` 버튼(현재 표시명 `준비 확인 시작`)은 생성자 또는 `Manage Guild` 사용자만 누를 수 있고, 참가자가 정원(10명)과 정확히 같을 때 `READY_CHECK`를 시작합니다. 모든 준비 상태를 초기화하고 120초 제한을 저장합니다.
+- 기존 `팀 배정·시작` 버튼(현재 표시명 `준비 확인 시작`)은 생성자 또는 `Manage Guild` 사용자만 누를 수 있고, 참가자가 선택한 게임 정원과 정확히 같을 때 `READY_CHECK`를 시작합니다. 모든 준비 상태를 초기화하고 120초 제한을 저장합니다.
 - 준비 카드에는 준비 완료/전체 인원, 준비·미준비 명단, 남은 시간, `준비` 토글(다시 누르면 준비 취소), `내전 취소`를 표시합니다. 실제 참가자만 준비할 수 있으며 중복 클릭은 한 번만 반영됩니다. 전원이 준비하면 한 트랜잭션에서 무작위 A/B 팀을 저장하고 `PLAYING`으로 전환한 뒤 카드와 음성 배치를 갱신합니다.
 - 정원이 찬 상태에서 `참가`를 누르면 대기열에 등록됩니다. 참가자와 대기자는 중복될 수 없고, 등록 시각 FIFO 순서를 유지합니다. `나가기`는 둘 다 취소할 수 있으며, 참가자가 나가거나 강퇴되면 같은 트랜잭션에서 첫 대기자를 승격합니다. `READY_CHECK` 명단이 바뀌면 준비를 초기화하고, 정원이 다시 차면 새 제한 시간으로 준비 확인을 재시작합니다. `PLAYING` 중 이탈·강퇴·팀 재배정은 하지 않습니다.
 - `/내전 강퇴 사용자:@사용자`는 현재 채널의 활성 내전에서 생성자 또는 `Manage Guild` 사용자만 사용할 수 있고, `RECRUITING`·`READY_CHECK`에서 참가자와 대기자를 모두 대상으로 합니다. 자기 자신 강퇴도 같은 규칙을 따르며, 대상이 아니면 ephemeral 오류를 반환합니다.
 - `/내전 전적 [사용자:@사용자]`는 생략 시 실행자 기준으로 현재 서버의 `FINISHED` 경기만 SQL 집계합니다. 총 경기·승·패·승률을 표시하고, `CANCELLED` 경기와 다른 서버의 경기는 제외하며 0경기 승률은 0%입니다.
+
+## 3A 게임·시즌·MMR
+
+게임 설정은 `games` 테이블에 둡니다. 관리 명령은 따로 안 만들었습니다. 두 번째 게임은 SQL Editor나 migration으로 아래 정도만 추가하면 됩니다. `capacity`는 `team_size * 2`여야 하고 짝수여야 합니다.
+
+```sql
+insert into public.games
+    ("key", name, team_size, capacity, default_rating, k_factor, rating_enabled)
+values
+    ('valorant', 'VALORANT', 5, 10, 1000, 32, true);
+```
+
+경기 생성 때 게임 정원과 활성 시즌을 경기 행에 저장합니다. 활성 시즌이 없으면 `시즌 1`을 자동 생성합니다. 시즌 변경은 `/내전 시즌시작`, `/내전 시즌종료`를 쓰면 되고 서버 관리 권한이 있어야 합니다. 서버·게임마다 활성 시즌은 하나만 허용됩니다.
+
+MMR은 팀 평균 기준 Elo입니다.
+
+```text
+expected_a = 1 / (1 + 10 ** ((avg_b - avg_a) / 400))
+delta_a = round(k_factor * (actual_a - expected_a))
+delta_b = -delta_a
+```
+
+기본 점수는 1000, K 값은 32입니다. 게임별로 바꿀 수 있습니다. 팀 배정 시점 점수를 참가자에 스냅샷으로 남기고 결과 저장, 점수 갱신, 이력 저장, 경기 종료를 한 트랜잭션에서 처리합니다. 3A migration 전에 끝난 기존 경기는 `Legacy` 시즌에 연결만 합니다. 기존 결과로 MMR을 다시 계산하지 않습니다.
 
 ## 모집 알림·만료와 재시작 복구
 
@@ -121,9 +148,11 @@ supabase link --project-ref <PROJECT_REF>
 supabase db push
 ```
 
-`supabase db push`는 연결한 원격 프로젝트에 아직 적용되지 않은 migration을 적용합니다. 이미 데이터가 있는 프로젝트에서는 먼저 백업과 대상 project-ref를 확인하세요. CLI를 사용할 수 없을 때만 대시보드 SQL Editor에서 `supabase/migrations/20260825000000_initial_schema.sql`을 검토해 수동 실행하고, migration 이력을 정리하기 전에는 `db push`와 섞어 쓰지 않습니다.
+`supabase db push`는 연결한 원격 프로젝트에 아직 적용되지 않은 migration을 적용합니다. 이미 데이터가 있는 프로젝트에서는 먼저 백업과 대상 project-ref를 확인하세요. CLI를 사용할 수 없을 때만 대시보드 SQL Editor에서 `supabase/migrations/20260826012146_schema.sql`을 검토해 수동 실행하고, migration 이력을 정리하기 전에는 `db push`와 섞어 쓰지 않습니다.
 
-2차 배포도 기존 migration 위에 점진적으로 적용합니다. (1) 백업과 project-ref를 확인하고, (2) `20260825000000_initial_schema.sql`이 적용된 것을 확인한 뒤, (3) `20260825010000_phase2.sql`을 다음 `supabase db push`에서 적용합니다. phase2 migration은 `READY_CHECK`, 모집·준비 마감 시각, 준비 시각, 참가자/`WAITLIST` 구분과 FIFO 인덱스를 추가하지만 기존 `matches`·참가자·결과 행을 삭제하거나 재작성하지 않습니다. 기존 `RECRUITING` 경기의 `recruitment_deadline_at`은 `NULL`로 남아 배포 직후 취소되지 않고, 기존 `PLAYING` 경기는 그대로 유지됩니다. 수동 SQL과 `db push`를 같은 변경에 섞지 말고, 실패 시 백업과 migration 이력을 확인한 뒤 재시도하세요.
+1차부터 3A까지는 `20260826012146_schema.sql` 하나에 실행 순서대로 들어 있습니다. 초기화한 DB에서는 프로젝트 루트에서 `supabase db push` 한 번이면 됩니다. 3A 부분은 기존 경기를 `Legacy` 시즌에 연결하고 경기 ID나 결과는 건드리지 않습니다. 수동 SQL과 `db push`를 같은 변경에 섞지 마세요.
+
+롤백할 때 migration 파일만 지우면 안 됩니다. 3A 이후 기록된 `player_ratings`, `rating_history`, `matches.season_id`가 있어서 컬럼이나 테이블부터 내리면 점수 이력과 시즌 연결이 없어집니다. 먼저 백업하고 봇을 중지한 다음, 어떤 데이터를 보존할지 정해서 별도 하향 migration을 작성해야 합니다.
 
 연결 문자열은 용도를 구분합니다.
 
@@ -142,7 +171,7 @@ supabase db push
 
 ## 테스트
 
-개발 의존성을 설치한 가상 환경에서 실행합니다. Discord 동작은 4개의 오프라인 테스트로 검증하고, `tests/test_matches.py`는 실제 PostgreSQL을 사용하는 통합 테스트로 분리되어 있습니다.
+개발 의존성을 설치한 가상 환경에서 실행합니다. Discord 쪽은 오프라인 테스트이고, `tests/test_matches.py`는 실제 PostgreSQL 통합 테스트입니다.
 
 ```powershell
 # TEST_DATABASE_URL이 없으면 통합 테스트 모듈은 안전하게 skip됩니다.

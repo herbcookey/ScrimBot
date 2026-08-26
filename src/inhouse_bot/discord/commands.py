@@ -46,7 +46,7 @@ class MatchCommandGroup(app_commands.Group):
         team_a_voice_channel_id: int | None = None,
         team_b_voice_channel_id: int | None = None,
     ) -> None:
-        super().__init__(name="내전", description="롤 5:5 내전 관리")
+        super().__init__(name="내전", description="게임 내전 관리")
         self.service = service
         self.team_a_voice_channel_id = team_a_voice_channel_id
         self.team_b_voice_channel_id = team_b_voice_channel_id
@@ -90,14 +90,15 @@ class MatchCommandGroup(app_commands.Group):
             except TypeError:
                 await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="생성", description="새 롤 5:5 내전을 생성합니다.")
-    @app_commands.describe(title="내전 제목", recruitment_minutes="모집시간(분)")
-    @app_commands.rename(title="제목", recruitment_minutes="모집시간")
+    @app_commands.command(name="생성", description="새 내전을 생성합니다.")
+    @app_commands.describe(title="내전 제목", recruitment_minutes="모집시간(분)", game="게임")
+    @app_commands.rename(title="제목", recruitment_minutes="모집시간", game="게임")
     async def create(
         self,
         interaction: discord.Interaction,
         title: str,
         recruitment_minutes: app_commands.Range[int, 5, 1440] | None = None,
+        game: str | None = None,
     ) -> None:
         if interaction.guild is None or interaction.channel is None:
             await self._send(interaction, "서버 채널에서만 사용할 수 있습니다.")
@@ -113,6 +114,7 @@ class MatchCommandGroup(app_commands.Group):
                 channel_id=int(interaction.channel.id),
                 creator_id=int(interaction.user.id),
                 title=title,
+                game_key=game or "lol",
                 **({} if recruitment_minutes is None else {"recruitment_minutes": int(recruitment_minutes)}),
             )
             match_id = int(_get(created, "id"))
@@ -188,16 +190,27 @@ class MatchCommandGroup(app_commands.Group):
             await self._send(interaction, "내전 강퇴 처리 중 오류가 발생했습니다.")
 
     @app_commands.command(name="전적", description="서버 내전 전적과 승률을 확인합니다.")
-    @app_commands.describe(user="전적을 조회할 사용자")
-    @app_commands.rename(user="사용자")
-    async def stats(self, interaction: discord.Interaction, user: discord.Member | None = None) -> None:
+    @app_commands.describe(user="전적을 조회할 사용자", game="게임", season="시즌 ID")
+    @app_commands.rename(user="사용자", game="게임", season="시즌")
+    async def stats(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member | None = None,
+        game: str | None = None,
+        season: int | None = None,
+    ) -> None:
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
         await self._defer(interaction)
         target = user or interaction.user
         try:
-            stats = await self.service.stats(int(interaction.guild.id), int(target.id))
+            stats = await self.service.stats(
+                int(interaction.guild.id),
+                int(target.id),
+                game_key=game or "lol",
+                season_id=season,
+            )
             games = int(_get(stats, "games", 0) or 0)
             wins = int(_get(stats, "wins", 0) or 0)
             losses = int(_get(stats, "losses", games - wins) or 0)
@@ -213,6 +226,102 @@ class MatchCommandGroup(app_commands.Group):
         except Exception:
             logger.exception("내전 전적 조회 실패")
             await self._send(interaction, "전적 조회 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="시즌시작", description="새 시즌을 시작합니다.")
+    @app_commands.describe(game="게임", name="시즌 이름")
+    @app_commands.rename(game="게임", name="이름")
+    async def season_start(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        game: str | None = None,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        if not self._manage_guild(interaction):
+            await self._send(interaction, "서버 관리 권한이 필요합니다.")
+            return
+        await self._defer(interaction)
+        try:
+            season = await self.service.start_season(
+                int(interaction.guild.id),
+                name,
+                game_key=game or "lol",
+                manage_guild=True,
+            )
+            await self._send(interaction, f"{_get(season, 'name')} 시즌을 시작했습니다.")
+        except MatchError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("시즌 시작 실패")
+            await self._send(interaction, "시즌 시작 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="시즌종료", description="현재 시즌을 종료합니다.")
+    @app_commands.describe(game="게임")
+    @app_commands.rename(game="게임")
+    async def season_end(
+        self,
+        interaction: discord.Interaction,
+        game: str | None = None,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        if not self._manage_guild(interaction):
+            await self._send(interaction, "서버 관리 권한이 필요합니다.")
+            return
+        await self._defer(interaction)
+        try:
+            season = await self.service.end_season(
+                int(interaction.guild.id),
+                game_key=game or "lol",
+                manage_guild=True,
+            )
+            await self._send(interaction, f"{_get(season, 'name')} 시즌을 종료했습니다.")
+        except MatchError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("시즌 종료 실패")
+            await self._send(interaction, "시즌 종료 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="랭킹", description="시즌 MMR 랭킹을 확인합니다.")
+    @app_commands.describe(game="게임", season="시즌 ID", limit="표시 인원수")
+    @app_commands.rename(game="게임", season="시즌", limit="인원수")
+    async def ranking(
+        self,
+        interaction: discord.Interaction,
+        game: str | None = None,
+        season: int | None = None,
+        limit: app_commands.Range[int, 1, 25] = 10,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        await self._defer(interaction)
+        try:
+            entries = await self.service.ranking(
+                int(interaction.guild.id),
+                game_key=game or "lol",
+                season_id=season,
+                limit=int(limit),
+            )
+            embed = discord.Embed(title="내전 MMR 랭킹", colour=0x5865F2)
+            if entries:
+                lines = [
+                    f"{index}. <@{int(_get(entry, 'user_id'))}> · "
+                    f"{int(_get(entry, 'rating'))}점 · {int(_get(entry, 'games_played'))}경기"
+                    for index, entry in enumerate(entries, start=1)
+                ]
+                embed.description = "\n".join(lines)
+            else:
+                embed.description = "아직 랭킹 기록이 없습니다."
+            await self._send_embed(interaction, embed)
+        except MatchError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("내전 랭킹 조회 실패")
+            await self._send(interaction, "랭킹 조회 중 오류가 발생했습니다.")
 
     @app_commands.command(name="결과", description="진행 중인 내전의 결과를 기록합니다.")
     @app_commands.describe(winner_team="승리 팀", memo="선택 메모")
@@ -253,6 +362,30 @@ class MatchCommandGroup(app_commands.Group):
         except Exception:
             logger.exception("내전 결과 처리 실패")
             await self._send(interaction, "내전 결과 처리 중 오류가 발생했습니다.")
+
+    @create.autocomplete("game")
+    @stats.autocomplete("game")
+    @season_start.autocomplete("game")
+    @season_end.autocomplete("game")
+    @ranking.autocomplete("game")
+    async def game_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        del interaction
+        try:
+            games = await self.service.list_games()
+        except Exception:
+            logger.exception("게임 자동완성 조회 실패")
+            return []
+        query = current.casefold()
+        return [
+            app_commands.Choice(name=str(_get(game, "name")), value=str(_get(game, "key")))
+            for game in games
+            if query in str(_get(game, "name")).casefold()
+            or query in str(_get(game, "key")).casefold()
+        ][:25]
 
     async def _active_for_channel(self, guild_id: int, channel_id: int) -> Any | None:
         return await self.service.get_active_match(guild_id, channel_id)

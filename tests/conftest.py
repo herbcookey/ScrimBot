@@ -22,9 +22,42 @@ if TEST_DATABASE_URL and os.getenv("DATABASE_URL") == TEST_DATABASE_URL:
 asyncpg = pytest.importorskip("asyncpg")
 
 
+async def _migration_applied(conn, migration_name: str) -> bool:
+    """이미 적용된 migration은 다시 실행하지 않는다.
+
+    Supabase CLI의 migration 이력을 테스트 DB에 요구하지 않고, 각
+    migration이 남기는 최소 스키마 표식을 확인한다. 기존 3A 스키마와
+    빈 DB를 같은 픽스처로 다루기 위한 처리다.
+    """
+
+    if migration_name.startswith("20260826012146"):
+        return bool(await conn.fetchval(
+            """
+            SELECT to_regclass('public.seasons') IS NOT NULL
+               AND to_regclass('public.player_ratings') IS NOT NULL
+               AND to_regclass('public.rating_history') IS NOT NULL
+            """
+        )) and bool(await conn.fetchval(
+            """
+            SELECT count(*) = 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'matches'
+              AND column_name = 'season_id'
+            """
+        )) and bool(await conn.fetchval(
+            """
+            SELECT count(*) = 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'match_participants'
+              AND column_name = 'rating_snapshot'
+            """
+        ))
+    return False
+
+
 @pytest_asyncio.fixture(scope="session")
 async def db_pool():
-    """테스트 전용 DB에 저장된 마이그레이션을 순서대로 적용한다."""
+    """테스트 전용 DB에 미적용 마이그레이션을 순서대로 적용한다."""
 
     if not TEST_DATABASE_URL:
         pytest.skip("TEST_DATABASE_URL이 없어 PostgreSQL 통합 테스트를 건너뜁니다")
@@ -36,6 +69,8 @@ async def db_pool():
     try:
         async with pool.acquire() as conn:
             for migration_path in migration_paths:
+                if await _migration_applied(conn, migration_path.name):
+                    continue
                 await conn.execute(migration_path.read_text(encoding="utf-8"))
         yield pool
     finally:
@@ -58,6 +93,18 @@ async def service_and_scope(db_pool):
             # 전적 테스트에서 서버 분리를 보려고 guild_id + 1도 쓴다.
             # 다음 테스트에 남지 않게 둘 다 지운다.
             await conn.execute(
+                "DELETE FROM player_ratings WHERE guild_id = ANY($1::bigint[])",
+                [guild_id, guild_id + 1],
+            )
+            await conn.execute(
                 "DELETE FROM matches WHERE guild_id = ANY($1::bigint[])",
                 [guild_id, guild_id + 1],
+            )
+            await conn.execute(
+                "DELETE FROM seasons WHERE guild_id = ANY($1::bigint[])",
+                [guild_id, guild_id + 1],
+            )
+            await conn.execute(
+                'DELETE FROM games WHERE "key" = ANY($1::text[])',
+                ["test-3v3", "test-2v2", f"test_{guild_id}"],
             )

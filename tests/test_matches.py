@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import inhouse_bot.repositories.matches as matches_repository
 from inhouse_bot.repositories.matches import (
     ActiveMatchExistsError,
     AlreadyJoinedError,
@@ -15,6 +16,7 @@ from inhouse_bot.repositories.matches import (
     NotParticipantError,
     PermissionDeniedError,
     ResultAlreadyRecordedError,
+    calculate_rating_delta,
 )
 
 
@@ -40,6 +42,60 @@ async def ready_all(service, match_id, *, now=T0):
 async def play(service, guild_id, channel_id, *, creator_id=1, now=T0):
     match = await fill(service, guild_id, channel_id, creator_id, now=now)
     return await ready_all(service, match.id, now=now)
+
+
+async def ensure_game(
+    service,
+    game_key: str,
+    *,
+    name: str = "테스트 게임",
+    team_size: int = 3,
+    capacity: int = 6,
+    default_rating: int = 1000,
+    k_factor: int = 32,
+    rating_enabled: bool = True,
+):
+    """3A 통합 테스트용 게임 설정을 DB에 한 번 등록한다."""
+
+    async with service.repository.pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO games
+                ("key", name, team_size, capacity, default_rating, k_factor, rating_enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT ("key") DO UPDATE SET
+                name = EXCLUDED.name,
+                team_size = EXCLUDED.team_size,
+                capacity = EXCLUDED.capacity,
+                default_rating = EXCLUDED.default_rating,
+                k_factor = EXCLUDED.k_factor,
+                rating_enabled = EXCLUDED.rating_enabled
+            """,
+            game_key,
+            name,
+            team_size,
+            capacity,
+            default_rating,
+            k_factor,
+            rating_enabled,
+        )
+
+
+async def play_game(service, guild_id, channel_id, game_key, user_ids, *, now=T0):
+    match = await service.create_match(
+        guild_id,
+        channel_id,
+        user_ids[0],
+        "3A 테스트",
+        game_key=game_key,
+        now=now,
+    )
+    for user_id in user_ids[1:]:
+        match = await service.join_match(match.id, user_id, now=now)
+    await service.start_match(match.id, user_ids[0], now=now)
+    for user_id in user_ids:
+        match = await service.toggle_ready(match.id, user_id, now=now)
+    return match
 
 
 @pytest.mark.asyncio
@@ -381,3 +437,218 @@ async def test_finish_result_and_cancel_transitions(service_and_scope):
     assert cancelled_playing.status == "CANCELLED"
     with pytest.raises(InvalidMatchStateError):
         await service.cancel_match(finished.id, 1, now=T0)
+
+
+@pytest.mark.asyncio
+async def test_phase3a_dynamic_capacity_and_team_size(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    game_key = "test-3v3"
+    await ensure_game(service, game_key, name="테스트 3대3", team_size=3, capacity=6)
+
+    match = await play_game(service, guild_id, channel_id, game_key, range(1, 7))
+
+    assert match.capacity == 6
+    assert match.team_size == 3
+    assert match.participant_count == 6
+    assert sum(item.team == "A" for item in match.participants) == 3
+    assert sum(item.team == "B" for item in match.participants) == 3
+    assert all(item.rating_snapshot == 1000 for item in match.participants)
+
+
+def test_phase3a_elo_delta_is_symmetric():
+    assert calculate_rating_delta(1000, 1000, "A", 32) == (16, -16)
+    assert calculate_rating_delta(1000, 1000, "B", 32) == (-16, 16)
+    assert calculate_rating_delta(1200, 1000, "A", 32) == (8, -8)
+    assert calculate_rating_delta(1200, 1000, "B", 32) == (-24, 24)
+
+
+@pytest.mark.asyncio
+async def test_phase3a_season_start_end_and_single_active(service_and_scope):
+    service, guild_id, _ = service_and_scope
+    game_key = "test-3v3"
+    await ensure_game(service, game_key)
+
+    first, second = await asyncio.gather(
+        service.start_season(
+            guild_id,
+            name="시즌 A",
+            game_key=game_key,
+            manage_guild=True,
+            now=T0,
+        ),
+        service.start_season(
+            guild_id,
+            name="시즌 B",
+            game_key=game_key,
+            manage_guild=True,
+            now=T0,
+        ),
+    )
+    seasons = await service.list_seasons(guild_id, game_key)
+    assert len(seasons) == 2
+    assert sum(item.ended_at is None for item in seasons) == 1
+    active = next(item for item in seasons if item.ended_at is None)
+    assert active.name in {"시즌 A", "시즌 B"}
+    assert first.id != second.id
+
+    ended = await service.end_season(
+        guild_id,
+        game_key=game_key,
+        manage_guild=True,
+        now=T0 + timedelta(seconds=2),
+    )
+    assert ended.id == active.id
+    assert ended.ended_at == T0 + timedelta(seconds=2)
+    assert not [item for item in await service.list_seasons(guild_id, game_key) if item.ended_at is None]
+
+
+@pytest.mark.asyncio
+async def test_phase3a_elo_default_delta_and_duplicate_is_idempotent(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    game_key = "test-3v3"
+    await ensure_game(service, game_key)
+    match = await play_game(service, guild_id, channel_id, game_key, range(1, 7))
+    winner = next(item.team for item in match.participants if item.user_id == 1)
+
+    finished = await service.finish_match(match.id, 1, winner, now=T0)
+    assert finished.status == "FINISHED"
+    with pytest.raises(ResultAlreadyRecordedError):
+        await service.finish_match(match.id, 1, winner, now=T0)
+
+    async with service.repository.pool.acquire() as conn:
+        ratings = await conn.fetch(
+            """
+            SELECT user_id, rating, games_played
+            FROM player_ratings
+            WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+            ORDER BY user_id
+            """,
+            guild_id,
+            match.game_id,
+            match.season_id,
+        )
+        history_count = await conn.fetchval(
+            "SELECT count(*) FROM rating_history WHERE match_id = $1",
+            match.id,
+        )
+    assert [int(item["rating"]) for item in ratings] == [
+        1016 if item.team == winner else 984
+        for item in sorted(match.participants, key=lambda value: value.user_id)
+    ]
+    assert all(int(item["games_played"]) == 1 for item in ratings)
+    assert int(history_count) == 6
+
+
+@pytest.mark.asyncio
+async def test_phase3a_finish_rolls_back_result_and_mmr_on_calculation_error(
+    service_and_scope,
+    monkeypatch,
+):
+    service, guild_id, channel_id = service_and_scope
+    game_key = "test-3v3"
+    await ensure_game(service, game_key)
+    match = await play_game(service, guild_id, channel_id, game_key, range(1, 7))
+    winner = next(item.team for item in match.participants if item.user_id == 1)
+
+    def fail_calculation(*_args):
+        raise RuntimeError("MMR 계산 실패")
+
+    monkeypatch.setattr(matches_repository, "calculate_rating_delta", fail_calculation)
+    with pytest.raises(RuntimeError, match="MMR 계산 실패"):
+        await service.finish_match(match.id, 1, winner, now=T0)
+
+    current = await service.get_match(match.id)
+    assert current is not None and current.status == "PLAYING"
+    async with service.repository.pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM match_results WHERE match_id = $1", match.id
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM rating_history WHERE match_id = $1", match.id
+        ) == 0
+        assert await conn.fetchval(
+            """
+            SELECT count(*) FROM player_ratings
+            WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+            """,
+            guild_id,
+            match.game_id,
+            match.season_id,
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_phase3a_ranking_isolated_by_guild_game_and_season(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    game_a = "test-3v3"
+    game_b = "test-2v2"
+    await ensure_game(service, game_a, name="테스트 3대3", team_size=3, capacity=6)
+    await ensure_game(service, game_b, name="테스트 2대2", team_size=2, capacity=4)
+
+    first = await play_game(service, guild_id, channel_id, game_a, range(1, 7))
+    winner_a = next(item.team for item in first.participants if item.user_id == 1)
+    await service.finish_match(first.id, 1, winner_a, now=T0)
+
+    await service.start_season(
+        guild_id,
+        name="시즌 2",
+        game_key=game_a,
+        manage_guild=True,
+        now=T0 + timedelta(seconds=1),
+    )
+    second = await play_game(
+        service,
+        guild_id,
+        channel_id + 1,
+        game_a,
+        range(11, 17),
+        now=T0 + timedelta(seconds=1),
+    )
+    winner_a2 = next(item.team for item in second.participants if item.user_id == 11)
+    await service.finish_match(second.id, 11, winner_a2, now=T0 + timedelta(seconds=1))
+
+    other_game = await play_game(
+        service,
+        guild_id,
+        channel_id + 2,
+        game_b,
+        range(21, 25),
+        now=T0 + timedelta(seconds=2),
+    )
+    winner_b = next(item.team for item in other_game.participants if item.user_id == 21)
+    await service.finish_match(other_game.id, 21, winner_b, now=T0 + timedelta(seconds=2))
+
+    other_guild = guild_id + 1
+    foreign = await play_game(
+        service,
+        other_guild,
+        channel_id + 3,
+        game_a,
+        range(31, 37),
+        now=T0 + timedelta(seconds=3),
+    )
+    foreign_winner = next(item.team for item in foreign.participants if item.user_id == 31)
+    await service.finish_match(foreign.id, 31, foreign_winner, now=T0 + timedelta(seconds=3))
+
+    ranking_a = await service.ranking(
+        guild_id,
+        game_key=game_a,
+        season_id=second.season_id,
+        limit=10,
+    )
+    ranking_b = await service.ranking(
+        guild_id,
+        game_key=game_b,
+        season_id=other_game.season_id,
+        limit=10,
+    )
+    assert {entry.user_id for entry in ranking_a} == set(range(11, 17))
+    assert {entry.user_id for entry in ranking_b} == set(range(21, 25))
+    assert [entry.rating for entry in ranking_a] == sorted(
+        (entry.rating for entry in ranking_a), reverse=True
+    )
+    assert len(await service.ranking(
+        guild_id, game_key=game_a, season_id=second.season_id, limit=2
+    )) == 2
+    assert (await service.stats(guild_id, 21, game_key=game_a)).games == 0
+    assert (await service.stats(guild_id, 21, game_key=game_b)).games == 1

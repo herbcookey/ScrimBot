@@ -11,6 +11,8 @@ from inhouse_bot.repositories.matches import (
     AlreadyJoinedError,
     CANCELLED,
     FINISHED,
+    Game,
+    GameNotFoundError,
     InvalidCapacityError,
     InvalidMatchStateError,
     InvalidRecruitmentMinutesError,
@@ -24,10 +26,16 @@ from inhouse_bot.repositories.matches import (
     MatchRepository,
     MatchResult,
     MatchStats,
+    RankingEntry,
     NotParticipantError,
     Participant,
     PermissionDeniedError,
     ResultAlreadyRecordedError,
+    Season,
+    SeasonNotFoundError,
+    InvalidRankingLimitError,
+    InvalidSeasonStateError,
+    calculate_rating_delta,
 )
 
 
@@ -55,7 +63,7 @@ class MatchService:
         title: str,
         *,
         game_key: str = "lol",
-        capacity: int = 10,
+        capacity: int | None = None,
         recruitment_minutes: int | None = None,
         now: datetime | None = None,
     ) -> Match:
@@ -181,8 +189,60 @@ class MatchService:
             now=now,
         )
 
-    async def stats(self, guild_id: int, user_id: int) -> MatchStats:
-        return await self.repository.stats(guild_id, user_id)
+    async def stats(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        game_key: str = "lol",
+        season_id: int | None = None,
+    ) -> MatchStats:
+        return await self.repository.stats(
+            guild_id, user_id, game_key=game_key, season_id=season_id
+        )
+
+    async def list_games(self) -> list[Game]:
+        return await self.repository.list_games()
+
+    async def list_seasons(self, guild_id: int, game_key: str = "lol") -> list[Season]:
+        return await self.repository.list_seasons(guild_id, game_key)
+
+    async def start_season(
+        self,
+        guild_id: int,
+        name: str,
+        *,
+        game_key: str = "lol",
+        manage_guild: bool = False,
+        now: datetime | None = None,
+    ) -> Season:
+        return await self.repository.start_season(
+            guild_id, name, game_key=game_key, manage_guild=manage_guild, now=now
+        )
+
+    async def end_season(
+        self,
+        guild_id: int,
+        *,
+        game_key: str = "lol",
+        manage_guild: bool = False,
+        now: datetime | None = None,
+    ) -> Season:
+        return await self.repository.end_season(
+            guild_id, game_key=game_key, manage_guild=manage_guild, now=now
+        )
+
+    async def ranking(
+        self,
+        guild_id: int,
+        *,
+        game_key: str = "lol",
+        season_id: int | None = None,
+        limit: int = 10,
+    ) -> list[RankingEntry]:
+        return await self.repository.ranking(
+            guild_id, game_key=game_key, season_id=season_id, limit=limit
+        )
 
     async def process_due_matches(self, now: datetime | None = None) -> list[MatchEvent]:
         return await self.repository.process_due_matches(
@@ -215,11 +275,15 @@ __all__ = [
     "AlreadyJoinedError",
     "CANCELLED",
     "FINISHED",
+    "Game",
+    "GameNotFoundError",
     "InvalidCapacityError",
     "InvalidMatchStateError",
     "InvalidRecruitmentMinutesError",
     "InvalidTimeoutError",
     "InvalidWinnerTeamError",
+    "InvalidRankingLimitError",
+    "InvalidSeasonStateError",
     "Match",
     "MatchError",
     "MatchEvent",
@@ -229,8 +293,12 @@ __all__ = [
     "MatchResult",
     "MatchService",
     "MatchStats",
+    "RankingEntry",
     "NotParticipantError",
     "Participant",
     "PermissionDeniedError",
     "ResultAlreadyRecordedError",
+    "Season",
+    "SeasonNotFoundError",
+    "calculate_rating_delta",
 ]

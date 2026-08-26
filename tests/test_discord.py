@@ -87,6 +87,19 @@ def test_create_command_recruitment_minutes_is_optional():
     assert parameter.min_value == 5 and parameter.max_value == 1440
 
 
+def test_phase3a_command_options_are_optional_and_bounded():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    assert MatchCommandGroup.create._params["game"].required is False
+    assert MatchCommandGroup.create._params["game"].autocomplete is not None
+    assert MatchCommandGroup.stats._params["game"].required is False
+    assert MatchCommandGroup.stats._params["season"].required is False
+    assert MatchCommandGroup.season_start._params["name"].required is True
+    assert MatchCommandGroup.season_end._params["game"].required is False
+    limit = MatchCommandGroup.ranking._params["limit"]
+    assert limit.default == 10 and limit.min_value == 1 and limit.max_value == 25
+
+
 def test_load_settings_rejects_duplicate_voice_channels(monkeypatch):
     from inhouse_bot.config import load_settings
 

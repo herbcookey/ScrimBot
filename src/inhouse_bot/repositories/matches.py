@@ -58,7 +58,7 @@ class InvalidMatchStateError(MatchError):
 
 class InvalidCapacityError(MatchError):
     code = "invalid_capacity"
-    message = "롤 내전 정원은 10명으로 고정입니다."
+    message = "게임 정원 설정이 올바르지 않습니다."
 
 
 class NotParticipantError(MatchError):
@@ -91,6 +91,64 @@ class InvalidTimeoutError(MatchError):
     message = "시간 제한은 양수여야 합니다."
 
 
+class GameNotFoundError(MatchError):
+    code = "game_not_found"
+    message = "게임을 찾을 수 없습니다."
+
+
+class SeasonNotFoundError(MatchError):
+    code = "season_not_found"
+    message = "시즌을 찾을 수 없습니다."
+
+
+class InvalidSeasonStateError(MatchError):
+    code = "invalid_season_state"
+    message = "현재 종료할 활성 시즌이 없습니다."
+
+
+class InvalidRankingLimitError(MatchError):
+    code = "invalid_ranking_limit"
+    message = "랭킹 인원수는 1명에서 25명 사이여야 합니다."
+
+
+@dataclass(frozen=True, slots=True)
+class Game:
+    id: int
+    key: str
+    name: str
+    team_size: int
+    capacity: int
+    default_rating: int
+    k_factor: int
+    rating_enabled: bool
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True, slots=True)
+class Season:
+    id: int
+    guild_id: int
+    game_id: int
+    name: str
+    started_at: datetime
+    ended_at: datetime | None
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True, slots=True)
+class RankingEntry:
+    user_id: int
+    rating: int
+    games_played: int
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
 @dataclass(frozen=True, slots=True)
 class Participant:
     id: int
@@ -100,6 +158,7 @@ class Participant:
     membership: str = MEMBER
     joined_at: datetime | None = None
     ready_at: datetime | None = None
+    rating_snapshot: int | None = None
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -132,6 +191,11 @@ class Match:
     created_at: datetime | None
     started_at: datetime | None
     ended_at: datetime | None
+    season_id: int | None = None
+    game_key: str = "lol"
+    game_name: str = "리그 오브 레전드"
+    team_size: int = 5
+    season_name: str = "Legacy"
     recruitment_deadline_at: datetime | None = None
     recruitment_reminded_at: datetime | None = None
     ready_deadline_at: datetime | None = None
@@ -237,6 +301,21 @@ def _validate_recruitment_minutes(minutes: int) -> int:
     return int(minutes)
 
 
+def calculate_rating_delta(
+    avg_a: float,
+    avg_b: float,
+    winner_team: str,
+    k_factor: int,
+) -> tuple[int, int]:
+    """두 팀 평균 점수로 A/B 변동값을 계산한다."""
+
+    if winner_team not in WINNER_TEAMS:
+        raise InvalidWinnerTeamError()
+    expected_a = 1 / (1 + 10 ** ((float(avg_b) - float(avg_a)) / 400))
+    delta_a = round(int(k_factor) * ((1 if winner_team == "A" else 0) - expected_a))
+    return delta_a, -delta_a
+
+
 class MatchRepository:
     """변경 트랜잭션에서 ``matches`` 행을 먼저 잠그는 저장소."""
 
@@ -253,6 +332,31 @@ class MatchRepository:
             membership=_row_value(row, "membership", MEMBER),
             joined_at=_row_value(row, "joined_at"),
             ready_at=_row_value(row, "ready_at"),
+            rating_snapshot=_row_value(row, "rating_snapshot"),
+        )
+
+    @staticmethod
+    def _game(row: Mapping[str, Any] | Any) -> Game:
+        return Game(
+            id=int(_row_value(row, "id")),
+            key=str(_row_value(row, "key")),
+            name=str(_row_value(row, "name")),
+            team_size=int(_row_value(row, "team_size")),
+            capacity=int(_row_value(row, "capacity")),
+            default_rating=int(_row_value(row, "default_rating")),
+            k_factor=int(_row_value(row, "k_factor")),
+            rating_enabled=bool(_row_value(row, "rating_enabled")),
+        )
+
+    @staticmethod
+    def _season(row: Mapping[str, Any] | Any) -> Season:
+        return Season(
+            id=int(_row_value(row, "id")),
+            guild_id=int(_row_value(row, "guild_id")),
+            game_id=int(_row_value(row, "game_id")),
+            name=str(_row_value(row, "name")),
+            started_at=_row_value(row, "started_at"),
+            ended_at=_row_value(row, "ended_at"),
         )
 
     @staticmethod
@@ -274,6 +378,11 @@ class MatchRepository:
             "channel_id": int(_row_value(row, "channel_id")),
             "message_id": _row_value(row, "message_id"),
             "game_id": int(_row_value(row, "game_id")),
+            "season_id": int(_row_value(row, "season_id")),
+            "game_key": str(_row_value(row, "game_key")),
+            "game_name": str(_row_value(row, "game_name")),
+            "team_size": int(_row_value(row, "team_size")),
+            "season_name": str(_row_value(row, "season_name")),
             "creator_id": int(_row_value(row, "creator_id")),
             "title": _row_value(row, "title"),
             "capacity": int(_row_value(row, "capacity")),
@@ -290,11 +399,17 @@ class MatchRepository:
     async def _fetch_match(self, conn: Any, match_id: int) -> Match:
         row = await conn.fetchrow(
             """
-            SELECT id, guild_id, channel_id, message_id, game_id, creator_id,
-                   title, capacity, status, created_at, started_at, ended_at,
-                   recruitment_deadline_at, recruitment_reminded_at,
-                   ready_deadline_at, cancel_reason
-            FROM matches WHERE id = $1
+            SELECT m.id, m.guild_id, m.channel_id, m.message_id, m.game_id,
+                   m.season_id, g."key" AS game_key, g.name AS game_name,
+                   g.team_size, s.name AS season_name, m.creator_id, m.title,
+                   m.capacity, m.status,
+                   m.created_at, m.started_at, m.ended_at,
+                   m.recruitment_deadline_at, m.recruitment_reminded_at,
+                   m.ready_deadline_at, m.cancel_reason
+            FROM matches AS m
+            JOIN games AS g ON g.id = m.game_id
+            JOIN seasons AS s ON s.id = m.season_id
+            WHERE m.id = $1
             """,
             match_id,
         )
@@ -302,7 +417,8 @@ class MatchRepository:
             raise MatchNotFoundError()
         items = await conn.fetch(
             """
-            SELECT id, match_id, user_id, team, membership, joined_at, ready_at
+            SELECT id, match_id, user_id, team, membership, joined_at, ready_at,
+                   rating_snapshot
             FROM match_participants WHERE match_id = $1 ORDER BY joined_at, id
             """,
             match_id,
@@ -328,7 +444,7 @@ class MatchRepository:
 
         row = await conn.fetchrow(
             """
-            SELECT id, guild_id, channel_id, message_id, game_id, creator_id,
+            SELECT id, guild_id, channel_id, message_id, game_id, season_id, creator_id,
                    title, capacity, status, created_at, started_at, ended_at,
                    recruitment_deadline_at, recruitment_reminded_at,
                    ready_deadline_at, cancel_reason
@@ -423,6 +539,91 @@ class MatchRepository:
                 now + timedelta(minutes=default_recruitment_minutes),
             )
 
+    async def list_games(self) -> list[Game]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT id, "key", name, team_size, capacity, default_rating, '
+                'k_factor, rating_enabled FROM games ORDER BY id'
+            )
+            return [self._game(row) for row in rows]
+
+    async def list_seasons(self, guild_id: int, game_key: str = "lol") -> list[Season]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT s.id, s.guild_id, s.game_id, s.name, s.started_at, s.ended_at
+                FROM seasons AS s JOIN games AS g ON g.id = s.game_id
+                WHERE s.guild_id = $1 AND g."key" = $2
+                ORDER BY s.started_at DESC, s.id DESC
+                """,
+                guild_id, game_key,
+            )
+            return [self._season(row) for row in rows]
+
+    async def start_season(
+        self,
+        guild_id: int,
+        name: str,
+        *,
+        game_key: str = "lol",
+        manage_guild: bool = False,
+        now: datetime | None = None,
+    ) -> Season:
+        if not manage_guild:
+            raise PermissionDeniedError("서버 관리 권한이 필요합니다.")
+        name = name.strip()
+        if not name:
+            raise InvalidSeasonStateError("시즌 이름을 입력해야 합니다.")
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                game = await conn.fetchrow(
+                    'SELECT id FROM games WHERE "key" = $1 FOR UPDATE', game_key
+                )
+                if game is None:
+                    raise GameNotFoundError()
+                game_id = int(_row_value(game, "id"))
+                await conn.execute(
+                    """UPDATE seasons SET ended_at = $3
+                       WHERE guild_id = $1 AND game_id = $2 AND ended_at IS NULL""",
+                    guild_id, game_id, current,
+                )
+                row = await conn.fetchrow(
+                    """INSERT INTO seasons (guild_id, game_id, name, started_at)
+                       VALUES ($1, $2, $3, $4)
+                       RETURNING id, guild_id, game_id, name, started_at, ended_at""",
+                    guild_id, game_id, name, current,
+                )
+                return self._season(row)
+
+    async def end_season(
+        self,
+        guild_id: int,
+        *,
+        game_key: str = "lol",
+        manage_guild: bool = False,
+        now: datetime | None = None,
+    ) -> Season:
+        if not manage_guild:
+            raise PermissionDeniedError("서버 관리 권한이 필요합니다.")
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                game = await conn.fetchrow(
+                    'SELECT id FROM games WHERE "key" = $1 FOR UPDATE', game_key
+                )
+                if game is None:
+                    raise GameNotFoundError()
+                row = await conn.fetchrow(
+                    """UPDATE seasons SET ended_at = $3
+                       WHERE guild_id = $1 AND game_id = $2 AND ended_at IS NULL
+                       RETURNING id, guild_id, game_id, name, started_at, ended_at""",
+                    guild_id, int(_row_value(game, "id")), current,
+                )
+                if row is None:
+                    raise InvalidSeasonStateError()
+                return self._season(row)
+
     async def create_match(
         self,
         guild_id: int,
@@ -431,32 +632,53 @@ class MatchRepository:
         title: str,
         *,
         game_key: str = "lol",
-        capacity: int = 10,
+        capacity: int | None = None,
         recruitment_minutes: int = DEFAULT_RECRUITMENT_MINUTES,
         now: datetime | None = None,
     ) -> Match:
-        if capacity != 10:
-            raise InvalidCapacityError()
         recruitment_minutes = _validate_recruitment_minutes(recruitment_minutes)
         created_at = _now(now)
         deadline = created_at + timedelta(minutes=recruitment_minutes)
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    game = await conn.fetchrow('SELECT id FROM games WHERE "key" = $1', game_key)
+                    game = await conn.fetchrow(
+                        'SELECT id, "key", name, team_size, capacity, default_rating, '
+                        'k_factor, rating_enabled FROM games WHERE "key" = $1 FOR UPDATE',
+                        game_key,
+                    )
                     if game is None:
-                        raise MatchNotFoundError("게임을 찾을 수 없습니다.")
+                        raise GameNotFoundError()
+                    game_capacity = int(_row_value(game, "capacity"))
+                    if capacity is not None and int(capacity) != game_capacity:
+                        raise InvalidCapacityError(
+                            f"{_row_value(game, 'name')} 내전 정원은 {game_capacity}명입니다."
+                        )
+                    capacity = game_capacity
+                    season = await conn.fetchrow(
+                        """SELECT id FROM seasons
+                           WHERE guild_id = $1 AND game_id = $2 AND ended_at IS NULL
+                           FOR UPDATE""",
+                        guild_id, int(_row_value(game, "id")),
+                    )
+                    if season is None:
+                        season = await conn.fetchrow(
+                            """INSERT INTO seasons (guild_id, game_id, name, started_at)
+                               VALUES ($1, $2, '시즌 1', $3) RETURNING id""",
+                            guild_id, int(_row_value(game, "id")), created_at,
+                        )
                     row = await conn.fetchrow(
                         """
                         INSERT INTO matches
-                            (guild_id, channel_id, game_id, creator_id, title, capacity,
-                             created_at, recruitment_deadline_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                            (guild_id, channel_id, game_id, season_id, creator_id, title,
+                             capacity, created_at, recruitment_deadline_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         RETURNING id
                         """,
                         guild_id,
                         channel_id,
                         _row_value(game, "id"),
+                        _row_value(season, "id"),
                         creator_id,
                         title,
                         capacity,
@@ -591,7 +813,9 @@ class MatchRepository:
                 count = await self._participant_count(conn, match_id)
                 capacity = int(_row_value(row, "capacity"))
                 if count != capacity:
-                    raise MatchFullError("정확히 10명이 참가해야 준비 확인을 시작할 수 있습니다.")
+                    raise MatchFullError(
+                        f"정확히 {capacity}명이 참가해야 준비 확인을 시작할 수 있습니다."
+                    )
                 await conn.execute(
                     """
                     UPDATE match_participants SET ready_at = NULL, team = NULL
@@ -663,6 +887,14 @@ class MatchRepository:
                 ))
                 started = False
                 if not was_ready and ready_count == int(_row_value(row, "capacity")):
+                    game = await conn.fetchrow(
+                        """SELECT team_size, capacity, default_rating
+                           FROM games WHERE id = $1""",
+                        int(_row_value(row, "game_id")),
+                    )
+                    team_size = int(_row_value(game, "team_size"))
+                    if int(_row_value(row, "capacity")) != team_size * 2:
+                        raise InvalidCapacityError()
                     rows = await conn.fetch(
                         """
                         SELECT user_id FROM match_participants
@@ -675,15 +907,33 @@ class MatchRepository:
                     if len(user_ids) != int(_row_value(row, "capacity")):
                         raise InvalidMatchStateError()
                     random.shuffle(user_ids)
-                    half = len(user_ids) // 2
-                    for team, members in (("A", user_ids[:half]), ("B", user_ids[half:])):
+                    ratings = await conn.fetch(
+                        """SELECT user_id, rating FROM player_ratings
+                           WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                             AND user_id = ANY($4::bigint[])""",
+                        int(_row_value(row, "guild_id")),
+                        int(_row_value(row, "game_id")),
+                        int(_row_value(row, "season_id")),
+                        user_ids,
+                    )
+                    rating_by_user = {
+                        int(_row_value(item, "user_id")): int(_row_value(item, "rating"))
+                        for item in ratings
+                    }
+                    default_rating = int(_row_value(game, "default_rating"))
+                    for team, members in (
+                        ("A", user_ids[:team_size]),
+                        ("B", user_ids[team_size:]),
+                    ):
                         for member_id in members:
                             await conn.execute(
                                 """
-                                UPDATE match_participants SET team = $3
+                                UPDATE match_participants
+                                SET team = $3, rating_snapshot = $4
                                 WHERE match_id = $1 AND user_id = $2 AND membership = 'PARTICIPANT'
                                 """,
                                 match_id, member_id, team,
+                                rating_by_user.get(member_id, default_rating),
                             )
                     await conn.execute(
                         """
@@ -795,6 +1045,21 @@ class MatchRepository:
                         if prior is not None:
                             raise ResultAlreadyRecordedError()
                     raise InvalidMatchStateError()
+                game = await conn.fetchrow(
+                    """SELECT default_rating, k_factor, rating_enabled
+                       FROM games WHERE id = $1""",
+                    int(_row_value(row, "game_id")),
+                )
+                participants = await conn.fetch(
+                    """SELECT user_id, team, rating_snapshot
+                       FROM match_participants
+                       WHERE match_id = $1 AND membership = 'PARTICIPANT'
+                         AND team IN ('A', 'B')
+                       ORDER BY user_id""",
+                    match_id,
+                )
+                if len(participants) != int(_row_value(row, "capacity")):
+                    raise InvalidMatchStateError("팀 배정 정보가 올바르지 않습니다.")
                 try:
                     await conn.execute(
                         """
@@ -807,6 +1072,73 @@ class MatchRepository:
                     if _is_unique_violation(exc):
                         raise ResultAlreadyRecordedError() from exc
                     raise
+                if bool(_row_value(game, "rating_enabled")):
+                    default_rating = int(_row_value(game, "default_rating"))
+                    user_ids = sorted(int(_row_value(item, "user_id")) for item in participants)
+                    for user_id in user_ids:
+                        await conn.execute(
+                            """INSERT INTO player_ratings
+                                   (guild_id, game_id, season_id, user_id, rating, games_played, updated_at)
+                               VALUES ($1, $2, $3, $4, $5, 0, $6)
+                               ON CONFLICT (guild_id, game_id, season_id, user_id) DO NOTHING""",
+                            int(_row_value(row, "guild_id")),
+                            int(_row_value(row, "game_id")),
+                            int(_row_value(row, "season_id")),
+                            user_id, default_rating, current,
+                        )
+                    rating_rows = await conn.fetch(
+                        """SELECT user_id, rating FROM player_ratings
+                           WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                             AND user_id = ANY($4::bigint[])
+                           ORDER BY user_id FOR UPDATE""",
+                        int(_row_value(row, "guild_id")),
+                        int(_row_value(row, "game_id")),
+                        int(_row_value(row, "season_id")),
+                        user_ids,
+                    )
+                    current_ratings = {
+                        int(_row_value(item, "user_id")): int(_row_value(item, "rating"))
+                        for item in rating_rows
+                    }
+                    by_team: dict[str, list[int]] = {"A": [], "B": []}
+                    participant_team: dict[int, str] = {}
+                    for participant in participants:
+                        user_id = int(_row_value(participant, "user_id"))
+                        team = str(_row_value(participant, "team"))
+                        participant_team[user_id] = team
+                        snapshot = _row_value(participant, "rating_snapshot")
+                        by_team[team].append(
+                            current_ratings[user_id] if snapshot is None else int(snapshot)
+                        )
+                    if not by_team["A"] or len(by_team["A"]) != len(by_team["B"]):
+                        raise InvalidMatchStateError("팀 인원이 올바르지 않습니다.")
+                    delta_a, delta_b = calculate_rating_delta(
+                        sum(by_team["A"]) / len(by_team["A"]),
+                        sum(by_team["B"]) / len(by_team["B"]),
+                        winner_team,
+                        int(_row_value(game, "k_factor")),
+                    )
+                    for user_id in user_ids:
+                        before = current_ratings[user_id]
+                        delta = delta_a if participant_team[user_id] == "A" else delta_b
+                        after = before + delta
+                        await conn.execute(
+                            """UPDATE player_ratings
+                               SET rating = $5, games_played = games_played + 1, updated_at = $6
+                               WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                                 AND user_id = $4""",
+                            int(_row_value(row, "guild_id")),
+                            int(_row_value(row, "game_id")),
+                            int(_row_value(row, "season_id")),
+                            user_id, after, current,
+                        )
+                        await conn.execute(
+                            """INSERT INTO rating_history
+                                   (match_id, user_id, rating_before, rating_delta,
+                                    rating_after, created_at)
+                               VALUES ($1, $2, $3, $4, $5, $6)""",
+                            match_id, user_id, before, delta, after, current,
+                        )
                 await conn.execute(
                     """
                     UPDATE matches SET status = 'FINISHED', ended_at = $2,
@@ -816,25 +1148,80 @@ class MatchRepository:
                 )
                 return await self._fetch_match(conn, match_id)
 
-    async def stats(self, guild_id: int, user_id: int) -> MatchStats:
+    async def stats(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        game_key: str = "lol",
+        season_id: int | None = None,
+    ) -> MatchStats:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT count(*) AS games,
                        count(*) FILTER (WHERE p.team = r.winner_team) AS wins
                 FROM matches m
+                JOIN games g ON g.id = m.game_id
                 JOIN match_participants p ON p.match_id = m.id
                 JOIN match_results r ON r.match_id = m.id
                 WHERE m.guild_id = $1 AND m.status = 'FINISHED'
                   AND p.user_id = $2 AND p.membership = 'PARTICIPANT'
                   AND p.team IS NOT NULL
+                  AND g."key" = $3
+                  AND ($4::bigint IS NULL OR m.season_id = $4)
                 """,
-                guild_id, user_id,
+                guild_id, user_id, game_key, season_id,
             )
             games = int(_row_value(row, "games", 0) or 0)
             wins = int(_row_value(row, "wins", 0) or 0)
             losses = games - wins
             return MatchStats(games, wins, losses, wins / games if games else 0.0)
+
+    async def ranking(
+        self,
+        guild_id: int,
+        *,
+        game_key: str = "lol",
+        season_id: int | None = None,
+        limit: int = 10,
+    ) -> list[RankingEntry]:
+        if not 1 <= int(limit) <= 25:
+            raise InvalidRankingLimitError()
+        async with self.pool.acquire() as conn:
+            game = await conn.fetchrow('SELECT id FROM games WHERE "key" = $1', game_key)
+            if game is None:
+                raise GameNotFoundError()
+            game_id = int(_row_value(game, "id"))
+            if season_id is None:
+                season = await conn.fetchrow(
+                    """SELECT id, guild_id, game_id, name, started_at, ended_at
+                       FROM seasons WHERE guild_id = $1 AND game_id = $2
+                         AND ended_at IS NULL""",
+                    guild_id, game_id,
+                )
+            else:
+                season = await conn.fetchrow(
+                    """SELECT id, guild_id, game_id, name, started_at, ended_at
+                       FROM seasons WHERE id = $1 AND guild_id = $2 AND game_id = $3""",
+                    season_id, guild_id, game_id,
+                )
+            if season is None:
+                raise SeasonNotFoundError()
+            rows = await conn.fetch(
+                """SELECT user_id, rating, games_played FROM player_ratings
+                   WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
+                   ORDER BY rating DESC, games_played DESC, user_id ASC LIMIT $4""",
+                guild_id, game_id, int(_row_value(season, "id")), int(limit),
+            )
+            return [
+                RankingEntry(
+                    int(_row_value(item, "user_id")),
+                    int(_row_value(item, "rating")),
+                    int(_row_value(item, "games_played")),
+                )
+                for item in rows
+            ]
 
     async def process_due_matches(
         self,
