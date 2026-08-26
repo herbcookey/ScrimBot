@@ -265,7 +265,12 @@ async def ensure_match_voice_channels(
         created: list[int] = []
         channels: dict[str, Any] = {}
         try:
-            for team, field in (("A", "team_a_voice_channel_id"), ("B", "team_b_voice_channel_id")):
+            for team, field, closed_field in (
+                ("A", "team_a_voice_channel_id", "team_a_voice_closed_at"),
+                ("B", "team_b_voice_channel_id", "team_b_voice_closed_at"),
+            ):
+                if _value(latest, closed_field) is not None:
+                    continue
                 stored_id = _value(latest, field)
                 channel = _validate_saved_channel(guild, category, int(stored_id), team) if stored_id else None
                 if channel is None:
@@ -311,11 +316,70 @@ async def ensure_match_voice_channels(
                 error=str(exc) or "보이스 채널 생성에 실패했습니다.",
             )
 
+        if "A" not in channels or "B" not in channels:
+            return VoiceMoveSummary(
+                created_channel_ids=tuple(created),
+                team_a_channel_id=_value(latest, "team_a_voice_channel_id"),
+                team_b_channel_id=_value(latest, "team_b_voice_channel_id"),
+            )
         moved = await move_match_participants(guild, latest, int(channels["A"].id), int(channels["B"].id))
         return VoiceMoveSummary(
             moved.success, moved.skipped, moved.failed, tuple(created),
             int(channels["A"].id), int(channels["B"].id), moved.error,
         )
+
+
+async def close_empty_match_voice_channel(
+    service: Any, channel: Any
+) -> VoiceCleanupSummary:
+    """DB에 저장된 빈 동적 보이스 채널 하나를 선점해서 삭제한다."""
+
+    guild = getattr(channel, "guild", None)
+    channel_id = getattr(channel, "id", None)
+    if guild is None or channel_id is None or len(getattr(channel, "members", ()) or ()) != 0:
+        return VoiceCleanupSummary()
+    claimed = await service.claim_empty_voice_channel(int(guild.id), int(channel_id))
+    if claimed is None:
+        return VoiceCleanupSummary()
+    match, team = claimed
+    match_id = int(_value(match, "id"))
+    category_id = _value(match, "voice_category_id")
+    if (
+        not isinstance(channel, discord.VoiceChannel)
+        or not _same_guild(channel, guild)
+        or int(getattr(channel, "category_id", 0) or 0) != int(category_id or 0)
+        or len(getattr(channel, "members", ()) or ()) != 0
+    ):
+        await service.reopen_empty_voice_channel(match_id, team, int(channel_id))
+        return VoiceCleanupSummary()
+    try:
+        await channel.delete(reason=f"{match_id}번째 내전 빈 보이스 정리")
+    except discord.NotFound:
+        pass
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "빈 내전 보이스 채널 삭제 실패",
+            extra={"match_id": match_id, "channel_id": int(channel_id)},
+        )
+        return VoiceCleanupSummary(failed=1)
+    await service.complete_empty_voice_channel(match_id, team, int(channel_id))
+    return VoiceCleanupSummary(deleted=1)
+
+
+async def close_empty_match_voice_channels(
+    service: Any, guild: Any, match: Any
+) -> VoiceCleanupSummary:
+    deleted = failed = 0
+    if guild is None:
+        return VoiceCleanupSummary()
+    for field in ("team_a_voice_channel_id", "team_b_voice_channel_id"):
+        channel_id = _value(match, field)
+        channel = guild.get_channel(int(channel_id)) if channel_id is not None else None
+        if isinstance(channel, discord.VoiceChannel) and len(channel.members) == 0:
+            result = await close_empty_match_voice_channel(service, channel)
+            deleted += result.deleted
+            failed += result.failed
+    return VoiceCleanupSummary(deleted, failed)
 
 
 async def cleanup_match_voice_channels(
@@ -336,10 +400,22 @@ async def cleanup_match_voice_channels(
         ))
     deleted = failed = 0
     cleared = {"A": False, "B": False}
-    for team, field in (("A", "team_a_voice_channel_id"), ("B", "team_b_voice_channel_id")):
+    current = datetime.now(timezone.utc)
+    scheduled_due = (
+        str(_value(match, "status", "")) in {"FINISHED", "CANCELLED"}
+        and _value(match, "voice_cleanup_at") is not None
+        and _value(match, "voice_cleanup_at") <= current
+    )
+    for team, field, closed_field in (
+        ("A", "team_a_voice_channel_id", "team_a_voice_closed_at"),
+        ("B", "team_b_voice_channel_id", "team_b_voice_closed_at"),
+    ):
         channel_id = _value(match, field)
         if channel_id is None:
             cleared[team] = True
+            continue
+        closed_at = _value(match, closed_field)
+        if closed_at is None and not scheduled_due:
             continue
         channel = guild.get_channel(int(channel_id)) if guild is not None else None
         if channel is None:
@@ -353,6 +429,9 @@ async def cleanup_match_voice_channels(
         ):
             failed += 1
             continue
+        if closed_at is not None and len(getattr(channel, "members", ()) or ()) != 0:
+            await service.reopen_empty_voice_channel(match_id, team, int(channel_id))
+            continue
         try:
             await channel.delete(reason=f"{match_id}번째 내전 보이스 정리")
         except discord.NotFound:
@@ -365,7 +444,7 @@ async def cleanup_match_voice_channels(
             cleared[team] = True
             deleted += 1
 
-    retry_at = datetime.now(timezone.utc) + timedelta(seconds=max(1, int(retry_seconds))) if failed else None
+    retry_at = current + timedelta(seconds=max(1, int(retry_seconds))) if failed else None
     await service.record_voice_cleanup(
         match_id,
         clear_team_a=cleared["A"],
@@ -379,6 +458,8 @@ __all__ = [
     "VoiceCleanupSummary",
     "VoiceMoveSummary",
     "VoiceSetupError",
+    "close_empty_match_voice_channel",
+    "close_empty_match_voice_channels",
     "cleanup_match_voice_channels",
     "ensure_match_voice_channels",
     "match_voice_channel_name",

@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 class Settings:
     discord_token: str
     discord_guild_id: int
+    bot_owner_id: int
     database_url: str
     ready_timeout_seconds: int = 120
     default_recruitment_minutes: int = 30
@@ -26,7 +27,7 @@ def load_settings() -> Settings:
     load_dotenv()
     missing = [
         name
-        for name in ("DISCORD_TOKEN", "DISCORD_GUILD_ID", "DATABASE_URL")
+        for name in ("DISCORD_TOKEN", "DISCORD_GUILD_ID", "BOT_OWNER_ID", "DATABASE_URL")
         if not os.getenv(name)
     ]
     if missing:
@@ -36,6 +37,8 @@ def load_settings() -> Settings:
         guild_id = int(os.environ["DISCORD_GUILD_ID"])
     except ValueError as exc:
         raise RuntimeError("DISCORD_GUILD_ID는 정수여야 합니다") from exc
+
+    bot_owner_id = _positive_int("BOT_OWNER_ID", 0)
 
     ready_timeout_seconds = _positive_int("READY_TIMEOUT_SECONDS", 120)
     default_recruitment_minutes = _bounded_int(
@@ -54,6 +57,7 @@ def load_settings() -> Settings:
     return Settings(
         discord_token=os.environ["DISCORD_TOKEN"],
         discord_guild_id=guild_id,
+        bot_owner_id=bot_owner_id,
         database_url=os.environ["DATABASE_URL"],
         ready_timeout_seconds=ready_timeout_seconds,
         default_recruitment_minutes=default_recruitment_minutes,

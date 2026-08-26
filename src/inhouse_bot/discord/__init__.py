@@ -5,6 +5,8 @@ from .views import MatchView
 from .voice import (
     VoiceCleanupSummary,
     VoiceMoveSummary,
+    close_empty_match_voice_channel,
+    close_empty_match_voice_channels,
     cleanup_match_voice_channels,
     ensure_match_voice_channels,
     match_voice_channel_name,
@@ -16,6 +18,8 @@ __all__ = [
     "MatchView",
     "VoiceCleanupSummary",
     "VoiceMoveSummary",
+    "close_empty_match_voice_channel",
+    "close_empty_match_voice_channels",
     "cleanup_match_voice_channels",
     "ensure_match_voice_channels",
     "match_voice_channel_name",

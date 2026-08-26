@@ -7,9 +7,11 @@ from inhouse_bot.role_assignment import (
     RoleAssignmentError,
     RolePlayer,
     balanced_assignment,
+    compact_tier_label,
     draft_completion_possible,
     finalize_draft,
     initial_role_rating,
+    parse_compact_tier,
     positive_rating_average,
     validate_preferences,
 )
@@ -32,6 +34,44 @@ def test_initial_role_rating_table():
     assert initial_role_rating("MASTER", "중") == 3000
     assert initial_role_rating("그랜드마스터", "상") == 3500
     assert initial_role_rating("챌린저") == 3800
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        (" 플래티넘 2 ", ("PLATINUM", 2)),
+        ("플래티넘2", ("PLATINUM", 2)),
+        ("마스터 하", ("MASTER", "LOW")),
+        ("MASTER 중", ("MASTER", "MID")),
+        ("마스터상", ("MASTER", "HIGH")),
+        ("그랜드마스터하", ("GRANDMASTER", "LOW")),
+        ("그랜드마스터중", ("GRANDMASTER", "MID")),
+        ("그랜드마스터상", ("GRANDMASTER", "HIGH")),
+        ("챌린저", ("CHALLENGER", None)),
+    ),
+)
+def test_parse_compact_tier_normalizes_and_reuses_rating_table(value, expected):
+    parsed = parse_compact_tier(value)
+    assert parsed == expected
+    assert initial_role_rating(*parsed) > 0
+
+
+def test_compact_platinum_two_is_1850():
+    assert initial_role_rating(*parse_compact_tier("플래티넘2")) == 1850
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("플래티넘", "플래티넘5", "골드0", "마스터2", "챌린저1", "아이언5", "없는티어"),
+)
+def test_parse_compact_tier_rejects_invalid_combinations(value):
+    with pytest.raises(RoleAssignmentError):
+        parse_compact_tier(value)
+
+
+def test_compact_tier_label_is_korean():
+    assert compact_tier_label("PLATINUM", 2) == "플래티넘2"
+    assert compact_tier_label("MASTER", "MID") == "마스터중"
 
 
 def test_positive_average_and_preferences():

@@ -49,7 +49,9 @@ _TIER_INPUTS = {
     "그랜드마스터": "GRANDMASTER",
     "챌린저": "CHALLENGER",
 }
+_TIER_LABELS = {value: key for key, value in _TIER_INPUTS.items()}
 _UPPER_STEPS = {"하": 100, "중": 200, "상": 300, "LOW": 100, "MID": 200, "HIGH": 300}
+_UPPER_STEP_LABELS = {"LOW": "하", "MID": "중", "HIGH": "상"}
 
 
 class RoleAssignmentError(ValueError):
@@ -113,6 +115,58 @@ def initial_role_rating(tier: str, detail: str | int | None = None) -> int:
             raise RoleAssignmentError("상위 티어 세부 단계는 하, 중, 상 중 하나여야 합니다.")
         return (2800 if canonical == "MASTER" else 3200) + step
     raise RoleAssignmentError("지원하지 않는 티어입니다.")
+
+
+def parse_compact_tier(value: str) -> tuple[str, int | str | None]:
+    """통합 티어 문자열을 표준 티어와 단계로 나눈다."""
+
+    compact = "".join(str(value).split())
+    if not compact:
+        raise RoleAssignmentError("티어를 입력해 주세요.")
+    normalized = compact.upper()
+    aliases = {
+        **{alias.upper(): canonical for alias, canonical in _TIER_INPUTS.items()},
+        **{canonical: canonical for canonical in (*_TIER_BASES, "MASTER", "GRANDMASTER", "CHALLENGER")},
+    }
+    matched = next(
+        ((alias, canonical) for alias, canonical in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True)
+         if normalized.startswith(alias)),
+        None,
+    )
+    if matched is None:
+        raise RoleAssignmentError("지원하지 않는 티어입니다.")
+    prefix, tier = matched
+    suffix = normalized[len(prefix):]
+
+    if tier in _TIER_BASES:
+        if suffix not in {"1", "2", "3", "4"}:
+            raise RoleAssignmentError("아이언부터 다이아까지는 세부 단계를 1~4로 입력해야 합니다.")
+        division: int | str | None = int(suffix)
+    elif tier in ("MASTER", "GRANDMASTER"):
+        division = {"하": "LOW", "중": "MID", "상": "HIGH"}.get(suffix, suffix)
+        if division not in ("LOW", "MID", "HIGH"):
+            raise RoleAssignmentError("상위 티어 세부 단계는 하, 중, 상 중 하나여야 합니다.")
+    else:
+        division = None
+        if suffix:
+            raise RoleAssignmentError("챌린저는 세부 단계 없이 입력해야 합니다.")
+
+    # 점수표와 유효성 검사는 기존 계산 함수 하나를 사용한다.
+    initial_role_rating(tier, division)
+    return tier, division
+
+
+def compact_tier_label(tier: str, division: int | str | None = None) -> str:
+    """표준 티어와 단계를 사용자용 한국어 통합 문자열로 만든다."""
+
+    canonical = str(tier).strip().upper()
+    label = _TIER_LABELS.get(canonical, canonical)
+    if canonical in _TIER_BASES:
+        return f"{label}{int(division)}"
+    if canonical in ("MASTER", "GRANDMASTER"):
+        step = str(division).strip().upper() if division is not None else ""
+        return f"{label}{_UPPER_STEP_LABELS.get(step, step)}"
+    return label
 
 
 def positive_rating_average(ratings: Iterable[int]) -> int:
@@ -280,10 +334,12 @@ __all__ = [
     "RoleAssignmentError",
     "RolePlayer",
     "balanced_assignment",
+    "compact_tier_label",
     "draft_completion_possible",
     "finalize_draft",
     "initial_role_rating",
     "normalize_role",
+    "parse_compact_tier",
     "positive_rating_average",
     "select_captains",
     "validate_preferences",

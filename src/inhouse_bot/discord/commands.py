@@ -11,9 +11,18 @@ from discord import app_commands
 
 from .renderer import render_match
 from .views import MatchView, SAFE_MENTIONS
-from .voice import ensure_match_voice_channels, resolve_voice_category_id
+from .voice import (
+    close_empty_match_voice_channels,
+    ensure_match_voice_channels,
+    resolve_voice_category_id,
+)
 from inhouse_bot.repositories.matches import MatchError
-from inhouse_bot.role_assignment import ROLE_LABELS
+from inhouse_bot.role_assignment import (
+    ROLE_LABELS,
+    RoleAssignmentError,
+    compact_tier_label,
+    parse_compact_tier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,15 +30,15 @@ ROLE_CHOICES = [
     app_commands.Choice(name=name, value=value)
     for name, value in (("탑", "TOP"), ("정글", "JUNGLE"), ("미드", "MID"), ("원딜", "ADC"), ("서폿", "SUPPORT"))
 ]
-TIER_CHOICES = [
-    app_commands.Choice(name=name, value=value)
-    for name, value in (
-        ("아이언", "IRON"), ("브론즈", "BRONZE"), ("실버", "SILVER"),
-        ("골드", "GOLD"), ("플래티넘", "PLATINUM"), ("에메랄드", "EMERALD"),
-        ("다이아", "DIAMOND"), ("마스터", "MASTER"),
-        ("그랜드마스터", "GRANDMASTER"), ("챌린저", "CHALLENGER"),
-    )
-]
+_COMPACT_TIER_CHOICES = tuple(
+    f"{tier}{division}"
+    for tier in ("아이언", "브론즈", "실버", "골드", "플래티넘", "에메랄드", "다이아")
+    for division in (1, 2, 3, 4)
+) + tuple(
+    f"{tier}{division}"
+    for tier in ("마스터", "그랜드마스터")
+    for division in ("하", "중", "상")
+) + ("챌린저",)
 
 
 def _choice_value(value: Any, default: Any = None) -> Any:
@@ -73,10 +82,12 @@ class MatchCommandGroup(app_commands.Group):
         self.team_b_voice_channel_id = team_b_voice_channel_id
         self.inhouse_voice_category_id = inhouse_voice_category_id
 
-    @staticmethod
-    def _manage_guild(interaction: discord.Interaction) -> bool:
-        permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
-        return bool(getattr(permissions, "manage_guild", False))
+    async def _is_bot_admin(self, interaction: discord.Interaction) -> bool:
+        guild = getattr(interaction, "guild", None)
+        user = getattr(interaction, "user", None)
+        if guild is None or user is None:
+            return False
+        return bool(await self.service.is_bot_admin(int(guild.id), int(user.id)))
 
     async def _defer(self, interaction: discord.Interaction) -> None:
         response = getattr(interaction, "response", None)
@@ -222,6 +233,78 @@ class MatchCommandGroup(app_commands.Group):
             logger.exception("내전 생성 실패")
             await self._send(interaction, "내전 생성 중 오류가 발생했습니다.")
 
+    @app_commands.command(name="관리자추가", description="봇 관리자를 추가합니다.")
+    @app_commands.describe(user="추가할 사용자")
+    @app_commands.rename(user="사용자")
+    async def admin_add(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        if bool(getattr(user, "bot", False)):
+            await self._send(interaction, "봇 계정은 관리자로 추가할 수 없습니다.")
+            return
+        await self._defer(interaction)
+        try:
+            await self.service.add_bot_admin(
+                int(interaction.guild.id), int(interaction.user.id), int(user.id)
+            )
+            await self._send(interaction, f"<@{int(user.id)}>님을 봇 관리자로 추가했습니다.")
+        except MatchError as exc:
+            await self._send(interaction, str(exc) or "봇 관리자 추가 권한이 없습니다.")
+        except Exception:
+            logger.exception("봇 관리자 추가 실패")
+            await self._send(interaction, "봇 관리자 추가 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="관리자삭제", description="봇 관리자를 삭제합니다.")
+    @app_commands.describe(user="삭제할 사용자")
+    @app_commands.rename(user="사용자")
+    async def admin_remove(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        await self._defer(interaction)
+        try:
+            await self.service.remove_bot_admin(
+                int(interaction.guild.id), int(interaction.user.id), int(user.id)
+            )
+            await self._send(interaction, f"<@{int(user.id)}>님을 봇 관리자에서 삭제했습니다.")
+        except MatchError as exc:
+            await self._send(interaction, str(exc) or "봇 관리자 삭제 권한이 없습니다.")
+        except Exception:
+            logger.exception("봇 관리자 삭제 실패")
+            await self._send(interaction, "봇 관리자 삭제 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="관리자목록", description="봇 관리자 목록을 확인합니다.")
+    async def admin_list(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        if not await self._is_bot_admin(interaction):
+            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
+            return
+        await self._defer(interaction)
+        try:
+            admins = tuple(await self.service.list_bot_admins(int(interaction.guild.id)) or ())
+            user_ids = []
+            owner_id = getattr(self.service, "bot_owner_id", None)
+            if owner_id is not None and int(owner_id) > 0:
+                user_ids.append(int(owner_id))
+            for admin in admins:
+                user_id = _get(admin, "user_id", _get(admin, "id", admin))
+                if user_id is None or int(user_id) in user_ids:
+                    continue
+                user_ids.append(int(user_id))
+            lines = [f"- <@{user_id}>" for user_id in user_ids]
+            await self._send(
+                interaction,
+                "봇 관리자 목록:\n" + ("\n".join(lines) if lines else "등록된 관리자가 없습니다."),
+            )
+        except MatchError as exc:
+            await self._send(interaction, str(exc) or "봇 관리자 목록을 조회할 수 없습니다.")
+        except Exception:
+            logger.exception("봇 관리자 목록 조회 실패")
+            await self._send(interaction, "봇 관리자 목록 조회 중 오류가 발생했습니다.")
+
     @app_commands.command(name="강퇴", description="모집 중인 내전에서 사용자를 강퇴합니다.")
     @app_commands.describe(user="강퇴할 사용자")
     @app_commands.rename(user="사용자")
@@ -231,6 +314,7 @@ class MatchCommandGroup(app_commands.Group):
             return
         await self._defer(interaction)
         try:
+            manager_override = await self._is_bot_admin(interaction)
             active = await self._active_for_channel(int(interaction.guild.id), int(interaction.channel.id))
             if active is None:
                 await self._send(interaction, "이 채널에 활성 내전이 없습니다.")
@@ -240,7 +324,7 @@ class MatchCommandGroup(app_commands.Group):
                 match_id,
                 int(user.id),
                 int(interaction.user.id),
-                manage_guild=self._manage_guild(interaction),
+                manager_override=manager_override,
             )
             await self._refresh_message(interaction, match_id)
             await self._announce_member_change(interaction, result, int(user.id), "강퇴")
@@ -330,8 +414,8 @@ class MatchCommandGroup(app_commands.Group):
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
-        if not self._manage_guild(interaction):
-            await self._send(interaction, "서버 관리 권한이 필요합니다.")
+        if not await self._is_bot_admin(interaction):
+            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
             return
         await self._defer(interaction)
         try:
@@ -339,7 +423,7 @@ class MatchCommandGroup(app_commands.Group):
                 int(interaction.guild.id),
                 name,
                 game_key=game or "lol",
-                manage_guild=True,
+                manager_override=True,
             )
             await self._send(interaction, f"{_get(season, 'name')} 시즌을 시작했습니다.")
         except MatchError as exc:
@@ -359,15 +443,15 @@ class MatchCommandGroup(app_commands.Group):
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
-        if not self._manage_guild(interaction):
-            await self._send(interaction, "서버 관리 권한이 필요합니다.")
+        if not await self._is_bot_admin(interaction):
+            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
             return
         await self._defer(interaction)
         try:
             season = await self.service.end_season(
                 int(interaction.guild.id),
                 game_key=game or "lol",
-                manage_guild=True,
+                manager_override=True,
             )
             await self._send(interaction, f"{_get(season, 'name')} 시즌을 종료했습니다.")
         except MatchError as exc:
@@ -454,42 +538,86 @@ class MatchCommandGroup(app_commands.Group):
             logger.exception("라인 변경 실패")
             await self._send(interaction, "라인 변경 중 오류가 발생했습니다.")
 
+    @app_commands.command(name="등록", description="현재 시즌의 내 라인 MMR을 등록합니다.")
+    @app_commands.describe(role="라인", tier="티어", game="게임")
+    @app_commands.rename(role="라인", tier="티어", game="게임")
+    @app_commands.choices(role=ROLE_CHOICES)
+    async def register(
+        self,
+        interaction: discord.Interaction,
+        role: app_commands.Choice[str],
+        tier: str,
+        game: str | None = None,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        try:
+            canonical_tier, division = parse_compact_tier(tier)
+        except RoleAssignmentError as exc:
+            await self._send(interaction, str(exc))
+            return
+        await self._defer(interaction)
+        try:
+            value = await self.service.register_role_rating(
+                int(interaction.guild.id),
+                int(interaction.user.id),
+                _choice_value(role),
+                tier,
+                game_key=game or "lol",
+            )
+            await self._send(
+                interaction,
+                f"{ROLE_LABELS.get(_choice_value(role), _choice_value(role))} MMR 등록 완료: "
+                f"{compact_tier_label(canonical_tier, division)} · {value}점",
+            )
+        except MatchError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("라인 MMR 등록 실패")
+            await self._send(interaction, "라인 MMR 등록 중 오류가 발생했습니다.")
+
     @app_commands.command(name="mmr설정", description="현재 시즌의 라인 MMR을 설정합니다.")
     @app_commands.describe(
-        user="설정할 사용자", role="라인", tier="티어", detail="세부 단계",
+        user="설정할 사용자", role="라인", tier="티어",
         rating="직접 지정할 점수", game="게임",
     )
     @app_commands.rename(
-        user="사용자", role="라인", tier="티어", detail="세부단계",
+        user="사용자", role="라인", tier="티어",
         rating="점수", game="게임",
     )
-    @app_commands.choices(role=ROLE_CHOICES, tier=TIER_CHOICES)
+    @app_commands.choices(role=ROLE_CHOICES)
     async def set_mmr(
         self,
         interaction: discord.Interaction,
         user: discord.Member,
         role: app_commands.Choice[str],
-        tier: app_commands.Choice[str] | None = None,
-        detail: str | None = None,
+        tier: str | None = None,
         rating: app_commands.Range[int, 0, 10000] | None = None,
         game: str | None = None,
     ) -> None:
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
-        if not self._manage_guild(interaction):
-            await self._send(interaction, "서버 관리 권한이 필요합니다.")
+        if not await self._is_bot_admin(interaction):
+            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
             return
         if tier is None and rating is None:
             await self._send(interaction, "티어 또는 직접 지정 점수가 필요합니다.")
             return
+        if rating is None:
+            try:
+                parse_compact_tier(tier or "")
+            except RoleAssignmentError as exc:
+                await self._send(interaction, str(exc))
+                return
         await self._defer(interaction)
         try:
             value = await self.service.set_role_rating(
                 int(interaction.guild.id), int(user.id), _choice_value(role),
-                game_key=game or "lol", tier=_choice_value(tier), detail=detail,
+                game_key=game or "lol", tier=tier,
                 rating=int(rating) if rating is not None else None,
-                manage_guild=True,
+                manager_override=True,
             )
             await self._send(
                 interaction,
@@ -569,8 +697,12 @@ class MatchCommandGroup(app_commands.Group):
                 int(interaction.user.id),
                 getattr(winner_team, "value", winner_team),
                 memo=memo,
-                manage_guild=self._manage_guild(interaction),
+                manager_override=await self._is_bot_admin(interaction),
             )
+            await close_empty_match_voice_channels(
+                self.service, interaction.guild, finished
+            )
+            finished = await self.service.get_match(match_id) or finished
             await self._refresh_message(interaction, match_id)
             text = "내전 결과를 기록했습니다."
             if _get(finished, "voice_cleanup_at") is not None:
@@ -588,6 +720,7 @@ class MatchCommandGroup(app_commands.Group):
     @season_start.autocomplete("game")
     @season_end.autocomplete("game")
     @ranking.autocomplete("game")
+    @register.autocomplete("game")
     @set_mmr.autocomplete("game")
     async def game_autocomplete(
         self,
@@ -606,6 +739,21 @@ class MatchCommandGroup(app_commands.Group):
             for game in games
             if query in str(_get(game, "name")).casefold()
             or query in str(_get(game, "key")).casefold()
+        ][:25]
+
+    @register.autocomplete("tier")
+    @set_mmr.autocomplete("tier")
+    async def tier_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        del interaction
+        query = current.casefold()
+        return [
+            app_commands.Choice(name=value, value=value)
+            for value in _COMPACT_TIER_CHOICES
+            if query in value.casefold()
         ][:25]
 
     async def _active_for_channel(self, guild_id: int, channel_id: int) -> Any | None:

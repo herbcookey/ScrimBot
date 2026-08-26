@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -88,6 +90,24 @@ class _Service:
         setattr(self.match, f"team_{team.lower()}_voice_channel_id", channel_id)
         return self.match
 
+    async def claim_empty_voice_channel(self, _guild_id, channel_id, **_kwargs):
+        for team in ("A", "B"):
+            if (
+                getattr(self.match, f"team_{team.lower()}_voice_channel_id") == channel_id
+                and getattr(self.match, f"team_{team.lower()}_voice_closed_at") is None
+            ):
+                setattr(self.match, f"team_{team.lower()}_voice_closed_at", object())
+                return self.match, team
+        return None
+
+    async def reopen_empty_voice_channel(self, _match_id, team, _channel_id):
+        setattr(self.match, f"team_{team.lower()}_voice_closed_at", None)
+        return self.match
+
+    async def complete_empty_voice_channel(self, _match_id, team, _channel_id):
+        setattr(self.match, f"team_{team.lower()}_voice_channel_id", None)
+        return self.match
+
     async def record_voice_cleanup(self, _match_id, **kwargs):
         self.cleanup = kwargs
         if kwargs["clear_team_a"]:
@@ -105,6 +125,9 @@ def _match(match_id=104):
         voice_category_id=10,
         team_a_voice_channel_id=None,
         team_b_voice_channel_id=None,
+        team_a_voice_closed_at=None,
+        team_b_voice_closed_at=None,
+        voice_cleanup_at=None,
         participants=(
             SimpleNamespace(user_id=1, team="A"),
             SimpleNamespace(user_id=2, team="B"),
@@ -199,10 +222,13 @@ async def test_cleanup_uses_only_saved_ids():
     category = guild.add_category()
     saved_a = guild.add_voice(20, "104번째 내전 1팀", category)
     saved_b = guild.add_voice(21, "104번째 내전 2팀", category)
+    saved_a.members.append(guild.get_member(1))
     guild.add_voice(22, "104번째 내전 1팀", category)
     match = _match()
     match.team_a_voice_channel_id = 20
     match.team_b_voice_channel_id = 21
+    match.status = "FINISHED"
+    match.voice_cleanup_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     service = _Service(match)
     result = await voice.cleanup_match_voice_channels(service, guild, match)
     assert result.deleted == 2 and result.failed == 0
@@ -236,6 +262,8 @@ async def test_partial_cleanup_keeps_failed_channel_id():
     match = _match()
     match.team_a_voice_channel_id = 20
     match.team_b_voice_channel_id = 21
+    match.status = "FINISHED"
+    match.voice_cleanup_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     service = _Service(match)
     result = await voice.cleanup_match_voice_channels(service, guild, match)
     assert result.deleted == 1 and result.failed == 1
@@ -243,3 +271,118 @@ async def test_partial_cleanup_keeps_failed_channel_id():
     assert service.cleanup["clear_team_a"] is True
     assert service.cleanup["clear_team_b"] is False
     assert service.cleanup["retry_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_empty_dynamic_channel_deletes_only_claimed_team():
+    guild = _Guild()
+    category = guild.add_category()
+    channel_a = guild.add_voice(20, "104번째 내전 1팀", category)
+    channel_b = guild.add_voice(21, "104번째 내전 2팀", category)
+    match = _match()
+    match.team_a_voice_channel_id = 20
+    match.team_b_voice_channel_id = 21
+    service = _Service(match)
+
+    result = await voice.close_empty_match_voice_channel(service, channel_a)
+
+    assert result.deleted == 1
+    channel_a.delete.assert_awaited_once()
+    channel_b.delete.assert_not_awaited()
+    assert match.team_a_voice_channel_id is None
+    assert match.team_a_voice_closed_at is not None
+    assert match.team_b_voice_channel_id == 21
+
+
+@pytest.mark.asyncio
+async def test_nonempty_untracked_and_fixed_channels_are_not_deleted():
+    guild = _Guild()
+    category = guild.add_category()
+    member = guild.get_member(1)
+    nonempty = guild.add_voice(20, "104번째 내전 1팀", category)
+    nonempty.members.append(member)
+    untracked = guild.add_voice(22, "104번째 내전 1팀", category)
+    match = _match()
+    match.team_a_voice_channel_id = 20
+    service = _Service(match)
+
+    assert await voice.close_empty_match_voice_channel(service, nonempty) == voice.VoiceCleanupSummary()
+    assert await voice.close_empty_match_voice_channel(service, untracked) == voice.VoiceCleanupSummary()
+    nonempty.delete.assert_not_awaited()
+    untracked.delete.assert_not_awaited()
+
+    match.voice_category_id = None
+    match.team_a_voice_channel_id = None
+    fixed = guild.add_voice(50, "고정 1팀", category)
+    assert await voice.close_empty_match_voice_channel(service, fixed) == voice.VoiceCleanupSummary()
+    fixed.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_empty_events_delete_once():
+    guild = _Guild()
+    category = guild.add_category()
+    channel = guild.add_voice(20, "104번째 내전 1팀", category)
+    match = _match()
+    match.team_a_voice_channel_id = 20
+    service = _Service(match)
+
+    results = await asyncio.gather(
+        voice.close_empty_match_voice_channel(service, channel),
+        voice.close_empty_match_voice_channel(service, channel),
+    )
+
+    assert sum(result.deleted for result in results) == 1
+    channel.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_empty_delete_keeps_id_and_poll_reopens_when_member_returns(monkeypatch):
+    class _Forbidden(Exception):
+        pass
+
+    monkeypatch.setattr(voice.discord, "Forbidden", _Forbidden)
+    guild = _Guild()
+    category = guild.add_category()
+    channel = guild.add_voice(20, "104번째 내전 1팀", category)
+    channel.delete.side_effect = _Forbidden()
+    match = _match()
+    match.team_a_voice_channel_id = 20
+    service = _Service(match)
+
+    result = await voice.close_empty_match_voice_channel(service, channel)
+    assert result.failed == 1
+    assert match.team_a_voice_channel_id == 20
+    assert match.team_a_voice_closed_at is not None
+
+    channel.delete.side_effect = None
+    channel.members.append(guild.get_member(1))
+    await voice.cleanup_match_voice_channels(service, guild, match)
+    assert match.team_a_voice_closed_at is None
+    assert match.team_a_voice_channel_id == 20
+    assert channel.delete.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_not_found_is_success_and_closed_channel_is_not_recreated(monkeypatch):
+    class _NotFound(Exception):
+        pass
+
+    monkeypatch.setattr(voice.discord, "NotFound", _NotFound)
+    guild = _Guild()
+    category = guild.add_category()
+    channel_a = guild.add_voice(20, "104번째 내전 1팀", category)
+    channel_b = guild.add_voice(21, "104번째 내전 2팀", category)
+    channel_a.delete.side_effect = _NotFound()
+    match = _match()
+    match.team_a_voice_channel_id = 20
+    match.team_b_voice_channel_id = 21
+    service = _Service(match)
+
+    result = await voice.close_empty_match_voice_channel(service, channel_a)
+    assert result.deleted == 1
+    assert match.team_a_voice_channel_id is None
+
+    await voice.ensure_match_voice_channels(service, guild, match)
+    assert all(created[0].name != "104번째 내전 1팀" for created in guild.created)
+    assert match.team_b_voice_channel_id == channel_b.id

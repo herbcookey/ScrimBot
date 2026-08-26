@@ -15,7 +15,12 @@ from .db import close_pool, create_pool
 from .discord.commands import add_match_commands
 from .discord.renderer import render_match
 from .discord.views import MatchView, SAFE_MENTIONS
-from .discord.voice import cleanup_match_voice_channels, ensure_match_voice_channels
+from .discord.voice import (
+    cleanup_match_voice_channels,
+    close_empty_match_voice_channel,
+    close_empty_match_voice_channels,
+    ensure_match_voice_channels,
+)
 from .services.matches import MatchService
 
 logger = logging.getLogger(__name__)
@@ -71,6 +76,7 @@ class InhouseBot(commands.Bot):
                 logger.info("DB 연결 풀 생성 완료")
             self.service = MatchService(
                 self.pool,
+                bot_owner_id=self.settings.bot_owner_id,
                 ready_timeout_seconds=self.settings.ready_timeout_seconds,
                 default_recruitment_minutes=self.settings.default_recruitment_minutes,
                 reminder_before_seconds=self.settings.reminder_before_seconds,
@@ -92,6 +98,28 @@ class InhouseBot(commands.Bot):
         logger.info("디스코드 로그인: %s", self.user)
         await self.recover_active_matches()
         self._ensure_poll_task()
+
+    async def on_voice_state_update(
+        self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+    ) -> None:
+        before_channel = before.channel
+        if (
+            self.service is None
+            or before_channel is None
+            or getattr(before_channel, "id", None) == getattr(after.channel, "id", None)
+            or len(getattr(before_channel, "members", ()) or ()) != 0
+        ):
+            return
+        try:
+            await close_empty_match_voice_channel(self.service, before_channel)
+        except Exception:
+            logger.exception(
+                "빈 내전 보이스 채널 처리 실패",
+                extra={
+                    "channel_id": getattr(before_channel, "id", None),
+                    "user_id": getattr(member, "id", None),
+                },
+            )
 
     def _ensure_poll_task(self) -> None:
         task = self._poll_task
@@ -188,6 +216,10 @@ class InhouseBot(commands.Bot):
         match = latest or match
         if latest is not None and str(_get(latest, "status")) != str(event_status):
             return
+        if str(_get(match, "status", "")) in {"FINISHED", "CANCELLED"}:
+            guild = self.get_guild(int(_get(match, "guild_id")))
+            await close_empty_match_voice_channels(self.service, guild, match)
+            match = await self.service.get_match(int(_get(match, "id"))) or match
         channel = await self._channel_for(int(_get(match, "channel_id")))
         if channel is None:
             return

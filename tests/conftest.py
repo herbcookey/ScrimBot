@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+TEST_BOT_OWNER_ID = 9_876_543_210
 if TEST_DATABASE_URL and os.getenv("DATABASE_URL") == TEST_DATABASE_URL:
     pytest.fail("TEST_DATABASE_URL은 DATABASE_URL과 달라야 합니다", pytrace=False)
 
@@ -84,6 +85,19 @@ async def _migration_applied(conn, migration_name: str) -> bool:
                     'team_b_voice_channel_id', 'voice_cleanup_at'
                  )"""
         ))
+    if migration_name.startswith("20260826060624"):
+        return bool(await conn.fetchval(
+            """SELECT count(*) = 2
+               FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = 'matches'
+                 AND column_name IN (
+                 'team_a_voice_closed_at', 'team_b_voice_closed_at'
+                 )"""
+        ))
+    if migration_name.startswith("20260826063825"):
+        return bool(await conn.fetchval(
+            "SELECT to_regclass('public.bot_admins') IS NOT NULL"
+        ))
     return False
 
 
@@ -117,7 +131,7 @@ async def service_and_scope(db_pool, request):
     token = uuid4().int
     guild_id = token % 9_000_000_000_000_000_000 + 1
     channel_id = (token >> 64) % 9_000_000_000_000_000_000 + 1
-    service = MatchService(db_pool)
+    service = MatchService(db_pool, bot_owner_id=TEST_BOT_OWNER_ID)
     legacy_mode = request.module.__name__.endswith("test_matches")
     if legacy_mode:
         async with db_pool.acquire() as conn:
@@ -130,6 +144,10 @@ async def service_and_scope(db_pool, request):
         async with db_pool.acquire() as conn:
             # 전적 테스트에서 서버 분리를 보려고 guild_id + 1도 쓴다.
             # 다음 테스트에 남지 않게 둘 다 지운다.
+            await conn.execute(
+                "DELETE FROM bot_admins WHERE guild_id = ANY($1::bigint[])",
+                [guild_id, guild_id + 1],
+            )
             await conn.execute(
                 "DELETE FROM player_role_ratings WHERE guild_id = ANY($1::bigint[])",
                 [guild_id, guild_id + 1],

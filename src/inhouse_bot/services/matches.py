@@ -10,6 +10,9 @@ from inhouse_bot.repositories.matches import (
     ActiveMatchExistsError,
     ActiveMembershipError,
     AlreadyJoinedError,
+    BotAdminAlreadyExistsError,
+    BotAdminNotFoundError,
+    BotOwnerProtectedError,
     CANCELLED,
     DRAFTING,
     FINISHED,
@@ -38,6 +41,7 @@ from inhouse_bot.repositories.matches import (
     Participant,
     PermissionDeniedError,
     ResultAlreadyRecordedError,
+    RoleRatingAlreadyExistsError,
     Season,
     SeasonNotFoundError,
     UnplacedRoleError,
@@ -54,16 +58,45 @@ class MatchService:
         self,
         pool: Any,
         *,
+        bot_owner_id: int,
         ready_timeout_seconds: int = 120,
         default_recruitment_minutes: int = 30,
         reminder_before_seconds: int = 300,
         voice_cleanup_delay_seconds: int = 600,
     ) -> None:
         self.repository = MatchRepository(pool)
+        self.bot_owner_id = int(bot_owner_id)
+        if self.bot_owner_id <= 0:
+            raise ValueError("bot_owner_id는 양의 정수여야 합니다")
         self.ready_timeout_seconds = int(ready_timeout_seconds)
         self.default_recruitment_minutes = int(default_recruitment_minutes)
         self.reminder_before_seconds = int(reminder_before_seconds)
         self.voice_cleanup_delay_seconds = int(voice_cleanup_delay_seconds)
+
+    async def is_bot_owner(self, user_id: int) -> bool:
+        return int(user_id) == self.bot_owner_id
+
+    async def is_bot_admin(self, guild_id: int, user_id: int) -> bool:
+        if await self.is_bot_owner(user_id):
+            return True
+        return await self.repository.is_bot_admin(guild_id, user_id)
+
+    async def add_bot_admin(self, guild_id: int, actor_id: int, target_id: int) -> None:
+        if not await self.is_bot_owner(actor_id):
+            raise PermissionDeniedError("봇 최고 관리자만 다른 봇 관리자를 추가할 수 있습니다.")
+        if await self.is_bot_owner(target_id):
+            raise BotOwnerProtectedError()
+        await self.repository.add_bot_admin(guild_id, actor_id, target_id)
+
+    async def remove_bot_admin(self, guild_id: int, actor_id: int, target_id: int) -> None:
+        if not await self.is_bot_owner(actor_id):
+            raise PermissionDeniedError("봇 최고 관리자만 다른 봇 관리자를 삭제할 수 있습니다.")
+        if await self.is_bot_owner(target_id):
+            raise BotOwnerProtectedError()
+        await self.repository.remove_bot_admin(guild_id, target_id)
+
+    async def list_bot_admins(self, guild_id: int) -> list[int]:
+        return await self.repository.list_bot_admins(guild_id)
 
     async def create_match(
         self,
@@ -154,13 +187,13 @@ class MatchService:
         match_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Match:
         return await self.repository.begin_ready_check(
             match_id,
             actor_id,
-            manage_guild=manage_guild,
+            manager_override=manager_override,
             now=now,
             ready_timeout_seconds=self.ready_timeout_seconds,
         )
@@ -170,13 +203,13 @@ class MatchService:
         match_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Match:
         return await self.begin_ready_check(
             match_id,
             actor_id,
-            manage_guild=manage_guild,
+            manager_override=manager_override,
             now=now,
         )
 
@@ -196,14 +229,14 @@ class MatchService:
         target_user_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Match:
         return await self.repository.kick_match_member(
             match_id,
             target_user_id,
             actor_id,
-            manage_guild=manage_guild,
+            manager_override=manager_override,
             now=now,
             ready_timeout_seconds=self.ready_timeout_seconds,
             default_recruitment_minutes=self.default_recruitment_minutes,
@@ -214,14 +247,14 @@ class MatchService:
         match_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         reason: str | None = None,
         now: datetime | None = None,
     ) -> Match:
         return await self.repository.cancel_match(
             match_id,
             actor_id,
-            manage_guild=manage_guild,
+            manager_override=manager_override,
             reason=reason,
             now=now,
             voice_cleanup_delay_seconds=self.voice_cleanup_delay_seconds,
@@ -234,7 +267,7 @@ class MatchService:
         winner_team: str,
         memo: str | None = None,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Match:
         return await self.repository.finish_match(
@@ -242,7 +275,7 @@ class MatchService:
             actor_id,
             winner_team,
             memo,
-            manage_guild=manage_guild,
+            manager_override=manager_override,
             now=now,
             voice_cleanup_delay_seconds=self.voice_cleanup_delay_seconds,
         )
@@ -272,12 +305,26 @@ class MatchService:
         tier: str | None = None,
         detail: str | int | None = None,
         rating: int | None = None,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> int:
         return await self.repository.set_role_rating(
             guild_id, user_id, role, game_key=game_key, tier=tier,
-            detail=detail, rating=rating, manage_guild=manage_guild, now=now,
+            detail=detail, rating=rating, manager_override=manager_override, now=now,
+        )
+
+    async def register_role_rating(
+        self,
+        guild_id: int,
+        user_id: int,
+        role: str,
+        tier: str,
+        *,
+        game_key: str = "lol",
+        now: datetime | None = None,
+    ) -> int:
+        return await self.repository.register_role_rating(
+            guild_id, user_id, role, tier, game_key=game_key, now=now
         )
 
     async def list_seasons(self, guild_id: int, game_key: str = "lol") -> list[Season]:
@@ -289,11 +336,11 @@ class MatchService:
         name: str,
         *,
         game_key: str = "lol",
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Season:
         return await self.repository.start_season(
-            guild_id, name, game_key=game_key, manage_guild=manage_guild, now=now
+            guild_id, name, game_key=game_key, manager_override=manager_override, now=now
         )
 
     async def end_season(
@@ -301,11 +348,11 @@ class MatchService:
         guild_id: int,
         *,
         game_key: str = "lol",
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Season:
         return await self.repository.end_season(
-            guild_id, game_key=game_key, manage_guild=manage_guild, now=now
+            guild_id, game_key=game_key, manager_override=manager_override, now=now
         )
 
     async def ranking(
@@ -348,6 +395,27 @@ class MatchService:
     async def list_due_voice_cleanups(self, now: datetime | None = None) -> list[Match]:
         return await self.repository.list_due_voice_cleanups(now)
 
+    async def claim_empty_voice_channel(
+        self, guild_id: int, channel_id: int, *, now: datetime | None = None
+    ) -> tuple[Match, str] | None:
+        return await self.repository.claim_empty_voice_channel(
+            guild_id, channel_id, now=now
+        )
+
+    async def reopen_empty_voice_channel(
+        self, match_id: int, team: str, channel_id: int
+    ) -> Match:
+        return await self.repository.reopen_empty_voice_channel(
+            match_id, team, channel_id
+        )
+
+    async def complete_empty_voice_channel(
+        self, match_id: int, team: str, channel_id: int
+    ) -> Match:
+        return await self.repository.complete_empty_voice_channel(
+            match_id, team, channel_id
+        )
+
     async def record_voice_cleanup(
         self,
         match_id: int,
@@ -379,6 +447,9 @@ __all__ = [
     "ActiveMatchExistsError",
     "ActiveMembershipError",
     "AlreadyJoinedError",
+    "BotAdminAlreadyExistsError",
+    "BotAdminNotFoundError",
+    "BotOwnerProtectedError",
     "CANCELLED",
     "DRAFTING",
     "FINISHED",
@@ -410,6 +481,7 @@ __all__ = [
     "Participant",
     "PermissionDeniedError",
     "ResultAlreadyRecordedError",
+    "RoleRatingAlreadyExistsError",
     "Season",
     "SeasonNotFoundError",
     "UnplacedRoleError",

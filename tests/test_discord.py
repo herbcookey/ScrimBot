@@ -5,9 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import discord
 
 from inhouse_bot.discord.renderer import render_match
 from inhouse_bot.discord.voice import move_match_participants
+from inhouse_bot.repositories.matches import RoleRatingAlreadyExistsError
 
 
 def _fields(embed):
@@ -193,6 +195,184 @@ def test_phase3b_command_options_and_names():
     assert MatchCommandGroup.ranking._params["role"].required is False
     assert MatchCommandGroup.set_mmr.name == "mmr설정"
     assert MatchCommandGroup.set_mmr._params["game"].autocomplete is not None
+    assert "detail" not in MatchCommandGroup.set_mmr._params
+    assert MatchCommandGroup.register._params["tier"].autocomplete is not None
+    assert "user" not in MatchCommandGroup.register._params
+
+
+def _command_interaction(*, channel_type=None, manage_guild=False, guild=True):
+    response = SimpleNamespace(is_done=lambda: True, send_message=AsyncMock(), defer=AsyncMock())
+    followup = SimpleNamespace(send=AsyncMock())
+    channel = SimpleNamespace(type=channel_type) if channel_type is not None else SimpleNamespace()
+    return SimpleNamespace(
+        guild=SimpleNamespace(id=123) if guild else None,
+        channel=channel,
+        user=SimpleNamespace(id=77, guild_permissions=SimpleNamespace(manage_guild=manage_guild)),
+        response=response,
+        followup=followup,
+    )
+
+
+@pytest.mark.asyncio
+async def test_register_command_uses_interaction_user_and_normalized_tier():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(register_role_rating=AsyncMock(return_value=1850))
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    await MatchCommandGroup.register.callback(
+        group, interaction, discord.app_commands.Choice(name="원딜", value="ADC"), " 플래티넘 2 ", None
+    )
+    service.register_role_rating.assert_awaited_once_with(
+        123, 77, "ADC", " 플래티넘 2 ", game_key="lol"
+    )
+    sent = interaction.followup.send.await_args.args[0]
+    assert sent == "원딜 MMR 등록 완료: 플래티넘2 · 1850점"
+
+
+@pytest.mark.asyncio
+async def test_register_command_preserves_duplicate():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(
+        register_role_rating=AsyncMock(side_effect=RoleRatingAlreadyExistsError("ADC"))
+    )
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    await MatchCommandGroup.register.callback(
+        group, interaction, discord.app_commands.Choice(name="원딜", value="ADC"), "플래티넘2", None
+    )
+    assert "이미 이번 시즌 원딜 MMR이 등록되어 있습니다" in interaction.followup.send.await_args.args[0]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "channel_type", (discord.ChannelType.voice, discord.ChannelType.public_thread)
+)
+async def test_register_command_allows_voice_chat_and_thread(channel_type):
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(register_role_rating=AsyncMock(return_value=1850))
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=channel_type)
+    await MatchCommandGroup.register.callback(
+        group, interaction, discord.app_commands.Choice(name="원딜", value="ADC"), "플래티넘2", None
+    )
+    service.register_role_rating.assert_awaited_once_with(
+        123, 77, "ADC", "플래티넘2", game_key="lol"
+    )
+
+
+@pytest.mark.asyncio
+async def test_register_command_rejects_dm():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(register_role_rating=AsyncMock(return_value=1850))
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(guild=False)
+    await MatchCommandGroup.register.callback(
+        group, interaction, discord.app_commands.Choice(name="원딜", value="ADC"), "플래티넘2", None
+    )
+    service.register_role_rating.assert_not_awaited()
+    assert interaction.followup.send.await_args.args[0] == "서버에서만 사용할 수 있습니다."
+
+
+@pytest.mark.asyncio
+async def test_voice_state_event_handles_disconnect_and_move_only_when_empty(monkeypatch):
+    import inhouse_bot.main as main_module
+
+    close = AsyncMock()
+    monkeypatch.setattr(main_module, "close_empty_match_voice_channel", close)
+    bot = SimpleNamespace(service=object())
+    member = SimpleNamespace(id=77)
+    channel = SimpleNamespace(id=20, members=[])
+
+    await main_module.InhouseBot.on_voice_state_update(
+        bot, member, SimpleNamespace(channel=channel), SimpleNamespace(channel=None)
+    )
+    close.assert_awaited_once_with(bot.service, channel)
+
+    close.reset_mock()
+    await main_module.InhouseBot.on_voice_state_update(
+        bot,
+        member,
+        SimpleNamespace(channel=channel),
+        SimpleNamespace(channel=SimpleNamespace(id=21)),
+    )
+    close.assert_awaited_once_with(bot.service, channel)
+
+    close.reset_mock()
+    channel.members.append(SimpleNamespace(id=88))
+    await main_module.InhouseBot.on_voice_state_update(
+        bot, member, SimpleNamespace(channel=channel), SimpleNamespace(channel=None)
+    )
+    close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_result_command_checks_empty_voice_without_waiting_cleanup_delay(monkeypatch):
+    import inhouse_bot.discord.commands as commands_module
+
+    finished = SimpleNamespace(id=42, voice_cleanup_at=None)
+    service = SimpleNamespace(
+        get_active_match=AsyncMock(return_value=SimpleNamespace(id=42)),
+        finish_match=AsyncMock(return_value=finished),
+        get_match=AsyncMock(return_value=finished),
+        is_bot_admin=AsyncMock(return_value=True),
+        voice_cleanup_delay_seconds=600,
+    )
+    close = AsyncMock()
+    monkeypatch.setattr(commands_module, "close_empty_match_voice_channels", close)
+    group = commands_module.MatchCommandGroup(service)
+    group._refresh_message = AsyncMock()
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    interaction.channel.id = 456
+
+    await commands_module.MatchCommandGroup.result.callback(
+        group, interaction, discord.app_commands.Choice(name="A팀", value="A"), None
+    )
+
+    close.assert_awaited_once_with(service, interaction.guild, finished)
+
+
+@pytest.mark.asyncio
+async def test_tier_autocomplete_filters_compact_values_to_25():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    group = MatchCommandGroup(object())
+    choices = await group.tier_autocomplete(_command_interaction(), "플래")
+    assert choices and all("플래" in choice.name for choice in choices)
+    assert len(await group.tier_autocomplete(_command_interaction(), "")) <= 25
+    master = await group.tier_autocomplete(_command_interaction(), "마스터")
+    assert {choice.name for choice in master} == {"마스터하", "마스터중", "마스터상", "그랜드마스터하", "그랜드마스터중", "그랜드마스터상"}
+
+
+@pytest.mark.asyncio
+async def test_admin_mmr_command_uses_compact_tier_and_prioritizes_score():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(
+        set_role_rating=AsyncMock(return_value=1850),
+        is_bot_admin=AsyncMock(return_value=True),
+    )
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text, manage_guild=True)
+    target = SimpleNamespace(id=88)
+    role = discord.app_commands.Choice(name="원딜", value="ADC")
+    await MatchCommandGroup.set_mmr.callback(group, interaction, target, role, "플래티넘2", None, "lol")
+    service.set_role_rating.assert_awaited_once_with(
+        123, 88, "ADC", game_key="lol", tier="플래티넘2", rating=None,
+        manager_override=True,
+    )
+
+    service.set_role_rating.reset_mock()
+    interaction = _command_interaction(channel_type=discord.ChannelType.text, manage_guild=True)
+    await MatchCommandGroup.set_mmr.callback(group, interaction, target, role, "잘못된티어", 1900, "lol")
+    service.set_role_rating.assert_awaited_once_with(
+        123, 88, "ADC", game_key="lol", tier="잘못된티어", rating=1900,
+        manager_override=True,
+    )
 
 
 def test_load_settings_rejects_duplicate_voice_channels(monkeypatch):
@@ -200,6 +380,7 @@ def test_load_settings_rejects_duplicate_voice_channels(monkeypatch):
 
     monkeypatch.setenv("DISCORD_TOKEN", "token")
     monkeypatch.setenv("DISCORD_GUILD_ID", "1")
+    monkeypatch.setenv("BOT_OWNER_ID", "99")
     monkeypatch.setenv("DATABASE_URL", "postgres://localhost/test")
     monkeypatch.setenv("TEAM_A_VOICE_CHANNEL_ID", "42")
     monkeypatch.setenv("TEAM_B_VOICE_CHANNEL_ID", "42")
@@ -212,6 +393,7 @@ def test_voice_cleanup_delay_allows_zero_and_rejects_negative(monkeypatch):
 
     monkeypatch.setenv("DISCORD_TOKEN", "token")
     monkeypatch.setenv("DISCORD_GUILD_ID", "1")
+    monkeypatch.setenv("BOT_OWNER_ID", "99")
     monkeypatch.setenv("DATABASE_URL", "postgres://localhost/test")
     monkeypatch.setenv("VOICE_CLEANUP_DELAY_SECONDS", "0")
     assert load_settings().voice_cleanup_delay_seconds == 0

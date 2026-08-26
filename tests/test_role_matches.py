@@ -8,7 +8,9 @@ import pytest
 from inhouse_bot.repositories.matches import (
     InvalidRolePreferencesError,
     PermissionDeniedError,
+    RoleRatingAlreadyExistsError,
     ResultAlreadyRecordedError,
+    SeasonNotFoundError,
     UnplacedRoleError,
 )
 from inhouse_bot.role_assignment import ROLES
@@ -26,16 +28,34 @@ async def _place(service, guild_id: int, user_id: int, preferences: tuple[str, s
     for offset, role in enumerate(preferences):
         await service.set_role_rating(
             guild_id, user_id, role, rating=1500 + user_id * 10 - offset * 5,
-            manage_guild=True, now=T0,
+            manager_override=True, now=T0,
         )
+
+
+@pytest.mark.asyncio
+async def test_register_role_rating_is_first_write_only(service_and_scope):
+    service, guild_id, _channel_id = service_and_scope
+    with pytest.raises(SeasonNotFoundError, match="관리자에게 시즌 시작을 요청"):
+        await service.register_role_rating(guild_id, 1, "ADC", "플래티넘2", now=T0)
+    await service.start_season(guild_id, "등록 테스트", manager_override=True, now=T0)
+    assert await service.register_role_rating(guild_id, 1, "ADC", "플래티넘2", now=T0) == 1850
+    with pytest.raises(RoleRatingAlreadyExistsError, match="원딜 MMR이 등록"):
+        await service.register_role_rating(guild_id, 1, "ADC", "골드1", now=T0)
+    async with service.repository.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT rating, games_played FROM player_role_ratings
+               WHERE guild_id = $1 AND user_id = $2 AND role = 'ADC'""",
+            guild_id, 1,
+        )
+    assert (row["rating"], row["games_played"]) == (1850, 0)
 
 
 @pytest.mark.asyncio
 async def test_role_preferences_waitlist_balanced_finish_stats_and_ranking(service_and_scope):
     service, guild_id, channel_id = service_and_scope
-    await service.start_season(guild_id, "3B 테스트", manage_guild=True, now=T0)
+    await service.start_season(guild_id, "3B 테스트", manager_override=True, now=T0)
     await service.set_role_rating(
-        guild_id, 1, "TOP", rating=1500, manage_guild=True, now=T0
+        guild_id, 1, "TOP", rating=1500, manager_override=True, now=T0
     )
     with pytest.raises(UnplacedRoleError, match="정글"):
         await service.create_match(
@@ -78,7 +98,7 @@ async def test_role_preferences_waitlist_balanced_finish_stats_and_ranking(servi
     target = next(item for item in match.participants if item.user_id == 1)
     snapshot = target.role_rating_snapshot
     await service.set_role_rating(
-        guild_id, 1, target.assigned_role, rating=2200, manage_guild=True, now=T0
+        guild_id, 1, target.assigned_role, rating=2200, manager_override=True, now=T0
     )
     assert (await service.get_match(match.id)).participants[0].role_rating_snapshot == snapshot
     finished = await service.finish_match(match.id, 1, "A", now=T0)
@@ -119,12 +139,12 @@ async def test_draft_state_captains_snake_lock_and_recovery(service_and_scope):
         7: ("ADC", "TOP"), 8: ("ADC", "TOP"),
         9: ("SUPPORT", "TOP"), 10: ("SUPPORT", "TOP"),
     }
-    await service.start_season(guild_id, "Draft 테스트", manage_guild=True, now=T0)
+    await service.start_season(guild_id, "Draft 테스트", manager_override=True, now=T0)
     for user_id, roles in preferences.items():
         for role in roles:
             await service.set_role_rating(
                 guild_id, user_id, role, rating=1500,
-                manage_guild=True, now=T0,
+                manager_override=True, now=T0,
             )
     match = await service.create_match(
         guild_id, channel_id, 1, "Draft 내전", assignment_mode="DRAFT",

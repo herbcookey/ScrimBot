@@ -18,6 +18,7 @@ from inhouse_bot.role_assignment import (
     finalize_draft,
     initial_role_rating,
     normalize_role,
+    parse_compact_tier,
     positive_rating_average,
     select_captains,
     validate_preferences,
@@ -90,7 +91,35 @@ class NotParticipantError(MatchError):
 
 class PermissionDeniedError(MatchError):
     code = "permission_denied"
-    message = "내전 생성자 또는 서버 관리 권한이 필요합니다."
+    message = "내전 생성자 또는 봇 관리자 권한이 필요합니다."
+
+
+class BotAdminAlreadyExistsError(MatchError):
+    code = "bot_admin_already_exists"
+    message = "이미 봇 관리자로 등록된 사용자입니다."
+
+
+class BotAdminNotFoundError(MatchError):
+    code = "bot_admin_not_found"
+    message = "등록된 봇 관리자가 아닙니다."
+
+
+class BotOwnerProtectedError(PermissionDeniedError):
+    code = "bot_owner_protected"
+    message = "봇 최고 관리자는 추가하거나 삭제할 수 없습니다."
+
+
+class RoleRatingAlreadyExistsError(MatchError):
+    code = "role_rating_already_exists"
+    message = "이미 이번 시즌 라인 MMR이 등록되어 있습니다. 수정은 관리자에게 문의하세요."
+
+    def __init__(self, role: str | None = None) -> None:
+        super().__init__(
+            f"이미 이번 시즌 {ROLE_LABELS.get(role, role or '라인')} MMR이 등록되어 있습니다. "
+            "수정은 관리자에게 문의하세요."
+            if role
+            else self.message
+        )
 
 
 class InvalidWinnerTeamError(MatchError):
@@ -274,6 +303,8 @@ class Match:
     voice_category_id: int | None = None
     team_a_voice_channel_id: int | None = None
     team_b_voice_channel_id: int | None = None
+    team_a_voice_closed_at: datetime | None = None
+    team_b_voice_closed_at: datetime | None = None
     voice_cleanup_at: datetime | None = None
     recruitment_deadline_at: datetime | None = None
     recruitment_reminded_at: datetime | None = None
@@ -418,6 +449,49 @@ class MatchRepository:
     def __init__(self, pool: Any) -> None:
         self.pool = pool
 
+    async def is_bot_admin(self, guild_id: int, user_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """SELECT EXISTS(
+                       SELECT 1 FROM public.bot_admins
+                       WHERE guild_id = $1 AND user_id = $2
+                   )""",
+                int(guild_id), int(user_id),
+            ))
+
+    async def add_bot_admin(self, guild_id: int, actor_id: int, target_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    """INSERT INTO public.bot_admins (guild_id, user_id, added_by)
+                       VALUES ($1, $2, $3)""",
+                    int(guild_id), int(target_id), int(actor_id),
+                )
+            except Exception as exc:
+                if _is_unique_violation(exc):
+                    raise BotAdminAlreadyExistsError() from exc
+                raise
+
+    async def remove_bot_admin(self, guild_id: int, target_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            removed = await conn.fetchval(
+                """DELETE FROM public.bot_admins
+                   WHERE guild_id = $1 AND user_id = $2
+                   RETURNING user_id""",
+                int(guild_id), int(target_id),
+            )
+            if removed is None:
+                raise BotAdminNotFoundError()
+
+    async def list_bot_admins(self, guild_id: int) -> list[int]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT user_id FROM public.bot_admins
+                   WHERE guild_id = $1 ORDER BY user_id""",
+                int(guild_id),
+            )
+            return [int(_row_value(row, "user_id")) for row in rows]
+
     @staticmethod
     def _participant(
         row: Mapping[str, Any] | Any,
@@ -498,6 +572,8 @@ class MatchRepository:
             "voice_category_id": _row_value(row, "voice_category_id"),
             "team_a_voice_channel_id": _row_value(row, "team_a_voice_channel_id"),
             "team_b_voice_channel_id": _row_value(row, "team_b_voice_channel_id"),
+            "team_a_voice_closed_at": _row_value(row, "team_a_voice_closed_at"),
+            "team_b_voice_closed_at": _row_value(row, "team_b_voice_closed_at"),
             "voice_cleanup_at": _row_value(row, "voice_cleanup_at"),
             "creator_id": int(_row_value(row, "creator_id")),
             "title": _row_value(row, "title"),
@@ -521,6 +597,7 @@ class MatchRepository:
                    m.assignment_mode, m.captain_a_id, m.captain_b_id,
                    m.draft_pick_index, m.voice_category_id,
                    m.team_a_voice_channel_id, m.team_b_voice_channel_id,
+                   m.team_a_voice_closed_at, m.team_b_voice_closed_at,
                    m.voice_cleanup_at, m.creator_id, m.title, m.capacity, m.status,
                    m.created_at, m.started_at, m.ended_at,
                    m.recruitment_deadline_at, m.recruitment_reminded_at,
@@ -587,7 +664,8 @@ class MatchRepository:
             SELECT id, guild_id, channel_id, message_id, game_id, season_id, creator_id,
                    title, capacity, status, assignment_mode, role_rating_enabled, captain_a_id,
                    captain_b_id, draft_pick_index, voice_category_id,
-                   team_a_voice_channel_id, team_b_voice_channel_id, voice_cleanup_at,
+                   team_a_voice_channel_id, team_b_voice_channel_id,
+                   team_a_voice_closed_at, team_b_voice_closed_at, voice_cleanup_at,
                    created_at, started_at, ended_at,
                    recruitment_deadline_at, recruitment_reminded_at,
                    ready_deadline_at, cancel_reason
@@ -605,8 +683,8 @@ class MatchRepository:
             raise InvalidMatchStateError()
 
     @staticmethod
-    def _require_manager(row: Any, actor_id: int, manage_guild: bool) -> None:
-        if int(_row_value(row, "creator_id")) != int(actor_id) and not manage_guild:
+    def _require_manager(row: Any, actor_id: int, manager_override: bool) -> None:
+        if int(_row_value(row, "creator_id")) != int(actor_id) and not manager_override:
             raise PermissionDeniedError()
 
     @staticmethod
@@ -844,14 +922,20 @@ class MatchRepository:
         tier: str | None = None,
         detail: str | int | None = None,
         rating: int | None = None,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> int:
-        if not manage_guild:
-            raise PermissionDeniedError("서버 관리 권한이 필요합니다.")
+        if not manager_override:
+            raise PermissionDeniedError("봇 관리자 권한이 필요합니다.")
         try:
             role = normalize_role(role)
-            value = int(rating) if rating is not None else initial_role_rating(tier or "", detail)
+            if rating is not None:
+                value = int(rating)
+            elif detail is not None:
+                value = initial_role_rating(tier or "", detail)
+            else:
+                parsed_tier, division = parse_compact_tier(tier or "")
+                value = initial_role_rating(parsed_tier, division)
         except (RoleAssignmentError, TypeError, ValueError) as exc:
             raise InvalidRolePreferencesError(str(exc)) from exc
         if not 0 <= value <= 10000:
@@ -886,6 +970,57 @@ class MatchRepository:
                 )
                 return value
 
+    async def register_role_rating(
+        self,
+        guild_id: int,
+        user_id: int,
+        role: str,
+        tier: str,
+        *,
+        game_key: str = "lol",
+        now: datetime | None = None,
+    ) -> int:
+        """사용자가 현재 시즌 라인 MMR을 최초 1회 등록한다."""
+
+        try:
+            canonical_role = normalize_role(role)
+            canonical_tier, division = parse_compact_tier(tier)
+            value = initial_role_rating(canonical_tier, division)
+        except (RoleAssignmentError, TypeError, ValueError) as exc:
+            raise InvalidRolePreferencesError(str(exc)) from exc
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                game = await conn.fetchrow(
+                    'SELECT id, role_rating_enabled FROM games WHERE "key" = $1 FOR UPDATE',
+                    game_key,
+                )
+                if game is None:
+                    raise GameNotFoundError()
+                if not bool(_row_value(game, "role_rating_enabled")):
+                    raise InvalidRolePreferencesError("이 게임은 라인 MMR을 사용하지 않습니다.")
+                season = await conn.fetchrow(
+                    """SELECT id FROM seasons WHERE guild_id = $1 AND game_id = $2
+                       AND ended_at IS NULL FOR UPDATE""",
+                    guild_id, int(_row_value(game, "id")),
+                )
+                if season is None:
+                    raise SeasonNotFoundError("활성 시즌이 없습니다. 관리자에게 시즌 시작을 요청하세요.")
+                row = await conn.fetchrow(
+                    """INSERT INTO player_role_ratings
+                           (guild_id, game_id, season_id, user_id, role, rating,
+                            games_played, updated_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, 0, $7)
+                       ON CONFLICT (guild_id, game_id, season_id, user_id, role)
+                       DO NOTHING
+                       RETURNING rating""",
+                    guild_id, int(_row_value(game, "id")), int(_row_value(season, "id")),
+                    user_id, canonical_role, value, current,
+                )
+                if row is None:
+                    raise RoleRatingAlreadyExistsError(canonical_role)
+                return int(_row_value(row, "rating", value))
+
     async def list_games(self) -> list[Game]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
@@ -913,11 +1048,11 @@ class MatchRepository:
         name: str,
         *,
         game_key: str = "lol",
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Season:
-        if not manage_guild:
-            raise PermissionDeniedError("서버 관리 권한이 필요합니다.")
+        if not manager_override:
+            raise PermissionDeniedError("봇 관리자 권한이 필요합니다.")
         name = name.strip()
         if not name:
             raise InvalidSeasonStateError("시즌 이름을 입력해야 합니다.")
@@ -948,11 +1083,11 @@ class MatchRepository:
         guild_id: int,
         *,
         game_key: str = "lol",
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
     ) -> Season:
-        if not manage_guild:
-            raise PermissionDeniedError("서버 관리 권한이 필요합니다.")
+        if not manager_override:
+            raise PermissionDeniedError("봇 관리자 권한이 필요합니다.")
         current = _now(now)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -1238,7 +1373,7 @@ class MatchRepository:
         match_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
         ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
     ) -> Match:
@@ -1247,7 +1382,7 @@ class MatchRepository:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
-                self._require_manager(row, actor_id, manage_guild)
+                self._require_manager(row, actor_id, manager_override)
                 self._require_state(row, RECRUITING)
                 count = await self._participant_count(conn, match_id)
                 capacity = int(_row_value(row, "capacity"))
@@ -1281,13 +1416,13 @@ class MatchRepository:
         match_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
         ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
     ) -> Match:
         """기존 호출부에서 쓰는 준비 확인 시작 메서드명."""
         return await self.begin_ready_check(
-            match_id, actor_id, manage_guild=manage_guild,
+            match_id, actor_id, manager_override=manager_override,
             now=now, ready_timeout_seconds=ready_timeout_seconds,
         )
 
@@ -1500,7 +1635,7 @@ class MatchRepository:
         target_user_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
         ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
         default_recruitment_minutes: int = DEFAULT_RECRUITMENT_MINUTES,
@@ -1511,7 +1646,7 @@ class MatchRepository:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
-                self._require_manager(row, actor_id, manage_guild)
+                self._require_manager(row, actor_id, manager_override)
                 self._require_state(row, RECRUITING, READY_CHECK)
                 member = await conn.fetchrow(
                     "SELECT membership FROM match_participants WHERE match_id = $1 AND user_id = $2",
@@ -1548,7 +1683,7 @@ class MatchRepository:
         match_id: int,
         actor_id: int,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         reason: str | None = None,
         now: datetime | None = None,
         voice_cleanup_delay_seconds: int = 600,
@@ -1557,7 +1692,7 @@ class MatchRepository:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
-                self._require_manager(row, actor_id, manage_guild)
+                self._require_manager(row, actor_id, manager_override)
                 self._require_state(row, RECRUITING, READY_CHECK, DRAFTING, PLAYING)
                 await conn.execute(
                     """
@@ -1583,7 +1718,7 @@ class MatchRepository:
         winner_team: str,
         memo: str | None = None,
         *,
-        manage_guild: bool = False,
+        manager_override: bool = False,
         now: datetime | None = None,
         voice_cleanup_delay_seconds: int = 600,
     ) -> Match:
@@ -1593,7 +1728,7 @@ class MatchRepository:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
-                self._require_manager(row, actor_id, manage_guild)
+                self._require_manager(row, actor_id, manager_override)
                 if _row_value(row, "status") != PLAYING:
                     if _row_value(row, "status") == FINISHED:
                         prior = await conn.fetchrow(
@@ -2134,10 +2269,13 @@ class MatchRepository:
         if team not in ("A", "B"):
             raise InvalidMatchStateError("보이스 팀은 A 또는 B여야 합니다.")
         column = "team_a_voice_channel_id" if team == "A" else "team_b_voice_channel_id"
+        closed_column = "team_a_voice_closed_at" if team == "A" else "team_b_voice_closed_at"
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_state(row, PLAYING)
+                if _row_value(row, closed_column) is not None:
+                    raise InvalidMatchStateError(f"{team}팀 보이스 채널은 이미 종료되었습니다.")
                 current = _row_value(row, column)
                 if current is not None and int(current) != int(channel_id) and not replace_missing:
                     raise InvalidMatchStateError(
@@ -2149,13 +2287,93 @@ class MatchRepository:
                 )
                 return await self._fetch_match(conn, match_id)
 
+    async def claim_empty_voice_channel(
+        self, guild_id: int, channel_id: int, *, now: datetime | None = None
+    ) -> tuple[Match, str] | None:
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """SELECT id,
+                              CASE WHEN team_a_voice_channel_id = $2 THEN 'A' ELSE 'B' END AS team
+                       FROM matches
+                       WHERE guild_id = $1 AND voice_category_id IS NOT NULL
+                         AND ((team_a_voice_channel_id = $2 AND team_a_voice_closed_at IS NULL)
+                           OR (team_b_voice_channel_id = $2 AND team_b_voice_closed_at IS NULL))
+                       FOR UPDATE""",
+                    guild_id, channel_id,
+                )
+                if len(rows) != 1:
+                    if len(rows) > 1:
+                        raise InvalidMatchStateError("같은 보이스 채널 ID가 여러 내전에 저장되어 있습니다.")
+                    return None
+                match_id = int(_row_value(rows[0], "id"))
+                team = str(_row_value(rows[0], "team"))
+                column = "team_a_voice_closed_at" if team == "A" else "team_b_voice_closed_at"
+                channel_column = (
+                    "team_a_voice_channel_id" if team == "A" else "team_b_voice_channel_id"
+                )
+                claimed = await conn.fetchval(
+                    f"""UPDATE matches SET {column} = $3
+                         WHERE id = $1 AND {channel_column} = $2 AND {column} IS NULL
+                         RETURNING id""",
+                    match_id, channel_id, current,
+                )
+                if claimed is None:
+                    return None
+                return await self._fetch_match(conn, match_id), team
+
+    async def reopen_empty_voice_channel(
+        self, match_id: int, team: str, channel_id: int
+    ) -> Match:
+        if team not in ("A", "B"):
+            raise InvalidMatchStateError("보이스 팀은 A 또는 B여야 합니다.")
+        closed_column = "team_a_voice_closed_at" if team == "A" else "team_b_voice_closed_at"
+        channel_column = "team_a_voice_channel_id" if team == "A" else "team_b_voice_channel_id"
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await self._locked_match(conn, match_id)
+                await conn.execute(
+                    f"""UPDATE matches SET {closed_column} = NULL
+                         WHERE id = $1 AND {channel_column} = $2""",
+                    match_id, channel_id,
+                )
+                return await self._fetch_match(conn, match_id)
+
+    async def complete_empty_voice_channel(
+        self, match_id: int, team: str, channel_id: int
+    ) -> Match:
+        if team not in ("A", "B"):
+            raise InvalidMatchStateError("보이스 팀은 A 또는 B여야 합니다.")
+        channel_column = "team_a_voice_channel_id" if team == "A" else "team_b_voice_channel_id"
+        closed_column = "team_a_voice_closed_at" if team == "A" else "team_b_voice_closed_at"
+        other_column = "team_b_voice_channel_id" if team == "A" else "team_a_voice_channel_id"
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await self._locked_match(conn, match_id)
+                await conn.execute(
+                    f"""UPDATE matches
+                         SET {channel_column} = NULL,
+                             voice_cleanup_at = CASE
+                                 WHEN {other_column} IS NULL THEN NULL
+                                 ELSE voice_cleanup_at END
+                         WHERE id = $1 AND {channel_column} = $2
+                           AND {closed_column} IS NOT NULL""",
+                    match_id, channel_id,
+                )
+                return await self._fetch_match(conn, match_id)
+
     async def list_due_voice_cleanups(self, now: datetime | None = None) -> list[Match]:
         current = _now(now)
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """SELECT id FROM matches
-                   WHERE voice_cleanup_at IS NOT NULL AND voice_cleanup_at <= $1
-                   ORDER BY voice_cleanup_at, id""",
+                   WHERE (voice_cleanup_at IS NOT NULL AND voice_cleanup_at <= $1)
+                      OR (team_a_voice_channel_id IS NOT NULL
+                          AND team_a_voice_closed_at IS NOT NULL)
+                      OR (team_b_voice_channel_id IS NOT NULL
+                          AND team_b_voice_closed_at IS NOT NULL)
+                   ORDER BY voice_cleanup_at NULLS FIRST, id""",
                 current,
             )
             return [
@@ -2176,7 +2394,14 @@ class MatchRepository:
                 row = await self._locked_match(conn, match_id)
                 team_a = None if clear_team_a else _row_value(row, "team_a_voice_channel_id")
                 team_b = None if clear_team_b else _row_value(row, "team_b_voice_channel_id")
-                cleanup_at = retry_at if team_a is not None or team_b is not None else None
+                if team_a is None and team_b is None:
+                    cleanup_at = None
+                elif retry_at is not None:
+                    cleanup_at = retry_at
+                elif _row_value(row, "status") in (FINISHED, CANCELLED):
+                    cleanup_at = _row_value(row, "voice_cleanup_at")
+                else:
+                    cleanup_at = None
                 await conn.execute(
                     """UPDATE matches
                        SET team_a_voice_channel_id = $2,

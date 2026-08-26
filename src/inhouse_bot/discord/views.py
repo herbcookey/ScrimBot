@@ -9,7 +9,11 @@ from typing import Any, Awaitable, Callable
 import discord
 
 from .renderer import render_match
-from .voice import VoiceMoveSummary, ensure_match_voice_channels
+from .voice import (
+    VoiceMoveSummary,
+    close_empty_match_voice_channels,
+    ensure_match_voice_channels,
+)
 from inhouse_bot.repositories.matches import MatchError
 
 logger = logging.getLogger(__name__)
@@ -104,10 +108,12 @@ class MatchView(discord.ui.View):
         ):
             self.add_item(button)
 
-    @staticmethod
-    def _manage_guild(interaction: discord.Interaction) -> bool:
-        permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
-        return bool(getattr(permissions, "manage_guild", False))
+    async def _is_bot_admin(self, interaction: discord.Interaction) -> bool:
+        guild = getattr(interaction, "guild", None)
+        user = getattr(interaction, "user", None)
+        if guild is None or user is None:
+            return False
+        return bool(await self.service.is_bot_admin(int(guild.id), int(user.id)))
 
     async def _defer(self, interaction: discord.Interaction) -> None:
         response = getattr(interaction, "response", None)
@@ -252,11 +258,17 @@ class MatchView(discord.ui.View):
 
     async def _start(self, interaction: discord.Interaction) -> None:
         actor_id = int(interaction.user.id)
+
+        async def start() -> Any:
+            return await self.service.start_match(
+                self.match_id,
+                actor_id,
+                manager_override=await self._is_bot_admin(interaction),
+            )
+
         await self._run(
             interaction,
-            lambda: self.service.start_match(
-                self.match_id, actor_id, manage_guild=self._manage_guild(interaction)
-            ),
+            start,
             "준비 확인을 시작했습니다.",
         )
 
@@ -283,11 +295,21 @@ class MatchView(discord.ui.View):
 
     async def _cancel(self, interaction: discord.Interaction) -> None:
         actor_id = int(interaction.user.id)
+
+        async def cancel() -> Any:
+            result = await self.service.cancel_match(
+                self.match_id,
+                actor_id,
+                manager_override=await self._is_bot_admin(interaction),
+            )
+            await close_empty_match_voice_channels(
+                self.service, getattr(interaction, "guild", None), result
+            )
+            return await self.service.get_match(self.match_id) or result
+
         await self._run(
             interaction,
-            lambda: self.service.cancel_match(
-                self.match_id, actor_id, manage_guild=self._manage_guild(interaction)
-            ),
+            cancel,
             lambda result: (
                 f"내전을 취소했습니다. 보이스 채널은 "
                 f"{int(getattr(self.service, 'voice_cleanup_delay_seconds', 600)) // 60}분 후 삭제됩니다."

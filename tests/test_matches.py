@@ -277,7 +277,7 @@ async def test_kick_permissions_state_and_self_kick(service_and_scope):
         await service.kick_match_member(match.id, 2, 99, now=T0)
 
     managed = await service.kick_match_member(
-        match.id, 2, 99, manage_guild=True, now=T0
+        match.id, 2, 99, manager_override=True, now=T0
     )
     assert managed.removed_user_id == 2
 
@@ -473,14 +473,14 @@ async def test_phase3a_season_start_end_and_single_active(service_and_scope):
             guild_id,
             name="시즌 A",
             game_key=game_key,
-            manage_guild=True,
+            manager_override=True,
             now=T0,
         ),
         service.start_season(
             guild_id,
             name="시즌 B",
             game_key=game_key,
-            manage_guild=True,
+            manager_override=True,
             now=T0,
         ),
     )
@@ -494,7 +494,7 @@ async def test_phase3a_season_start_end_and_single_active(service_and_scope):
     ended = await service.end_season(
         guild_id,
         game_key=game_key,
-        manage_guild=True,
+        manager_override=True,
         now=T0 + timedelta(seconds=2),
     )
     assert ended.id == active.id
@@ -593,7 +593,7 @@ async def test_phase3a_ranking_isolated_by_guild_game_and_season(service_and_sco
         guild_id,
         name="시즌 2",
         game_key=game_a,
-        manage_guild=True,
+        manager_override=True,
         now=T0 + timedelta(seconds=1),
     )
     second = await play_game(

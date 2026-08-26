@@ -187,7 +187,20 @@ def render_match(match: Any) -> discord.Embed:
             embed.add_field(name=f"{team}팀", value=_roster(members, show_role=role_enabled), inline=True)
         voice_a = _get(match, "team_a_voice_channel_id")
         voice_b = _get(match, "team_b_voice_channel_id")
-        if voice_a is not None and voice_b is not None:
+        closed_a = _get(match, "team_a_voice_closed_at")
+        closed_b = _get(match, "team_b_voice_closed_at")
+        if closed_a is not None or closed_b is not None:
+            embed.add_field(
+                name="1팀 보이스",
+                value=f"<#{int(voice_a)}>" if voice_a is not None else "종료됨",
+                inline=True,
+            )
+            embed.add_field(
+                name="2팀 보이스",
+                value=f"<#{int(voice_b)}>" if voice_b is not None else "종료됨",
+                inline=True,
+            )
+        elif voice_a is not None and voice_b is not None:
             embed.add_field(name="1팀 보이스", value=f"<#{int(voice_a)}>", inline=True)
             embed.add_field(name="2팀 보이스", value=f"<#{int(voice_b)}>", inline=True)
         elif voice_a is not None or voice_b is not None:

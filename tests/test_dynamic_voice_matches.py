@@ -95,3 +95,30 @@ async def test_voice_ids_constraint_cleanup_schedule_and_partial_clear(service_a
     assert partial.team_a_voice_channel_id is None
     assert partial.team_b_voice_channel_id == 1002
     assert partial.voice_cleanup_at == retry_at
+
+
+@pytest.mark.asyncio
+async def test_empty_voice_claim_is_conditional_and_closed_channel_stays_closed(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    key = await _game(service, guild_id)
+    match = await _playing(service, guild_id, channel_id, 1, 2, key, 10)
+    match = await service.set_voice_channel_id(match.id, "A", 1001)
+    match = await service.set_voice_channel_id(match.id, "B", 1002)
+
+    claims = await asyncio.gather(
+        service.claim_empty_voice_channel(guild_id, 1001, now=T0),
+        service.claim_empty_voice_channel(guild_id, 1001, now=T0),
+    )
+    assert sum(claim is not None for claim in claims) == 1
+    claimed_match, team = next(claim for claim in claims if claim is not None)
+    assert team == "A" and claimed_match.team_a_voice_closed_at == T0
+    assert [item.id for item in await service.list_due_voice_cleanups(T0)] == [match.id]
+
+    reopened = await service.reopen_empty_voice_channel(match.id, "A", 1001)
+    assert reopened.team_a_voice_closed_at is None
+    claimed = await service.claim_empty_voice_channel(guild_id, 1001, now=T0)
+    assert claimed is not None
+    completed = await service.complete_empty_voice_channel(match.id, "A", 1001)
+    assert completed.team_a_voice_channel_id is None
+    assert completed.team_a_voice_closed_at == T0
+    assert completed.team_b_voice_channel_id == 1002
