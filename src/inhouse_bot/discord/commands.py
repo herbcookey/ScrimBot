@@ -9,19 +9,21 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from .renderer import render_match
-from .views import MatchView, SAFE_MENTIONS
-from .voice import (
-    close_empty_match_voice_channels,
-    ensure_match_voice_channels,
-    resolve_voice_category_id,
-)
+from inhouse_bot import __version__
 from inhouse_bot.repositories.matches import MatchError
 from inhouse_bot.role_assignment import (
     ROLE_LABELS,
     RoleAssignmentError,
     compact_tier_label,
     parse_compact_tier,
+)
+
+from .renderer import render_match
+from .views import MatchView, SAFE_MENTIONS
+from .voice import (
+    close_empty_match_voice_channels,
+    ensure_match_voice_channels,
+    resolve_voice_category_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,14 +131,16 @@ class MatchCommandGroup(app_commands.Group):
             title="내전 봇 사용법",
             description=(
                 "모든 명령은 `/내전`으로 시작합니다. "
-                "`[대괄호]`로 표시한 옵션은 생략할 수 있습니다."
+                "`[대괄호]`로 표시한 옵션은 생략할 수 있습니다. "
+                "업데이트 내용은 `/내전 패치내역`에서 확인할 수 있습니다."
             ),
             colour=0x5865F2,
         )
         embed.add_field(
             name="1. 내전 만들기",
             value=(
-                "`/내전 생성 제목 [모집시간] [게임] [방식] [1지망] [2지망] [3지망]`\n"
+                "`/내전 생성 제목 1지망 2지망 [모집시간] [게임] [방식] [3지망]`\n"
+                "생성자는 1·2지망을 반드시 선택해야 합니다. "
                 "라인 MMR 내전은 선택할 모든 지망을 `/내전 등록`으로 먼저 등록해야 합니다.\n"
                 "생성된 카드에서 **참가 → 준비 확인 시작 → 준비** 순으로 진행합니다. "
                 "참가를 취소하려면 **나가기** 버튼을 누릅니다."
@@ -175,6 +179,36 @@ class MatchCommandGroup(app_commands.Group):
         embed.set_footer(text="세부 옵션은 /내전 입력 후 Discord 자동완성에서 확인하세요.")
         await self._send_embed(interaction, embed)
 
+    @app_commands.command(name="패치내역", description="내전 봇의 버전별 주요 변경 사항을 확인합니다.")
+    async def patch_notes(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title=f"내전 봇 패치 내역 · v{__version__}",
+            description="최신 버전부터 주요 변경 사항을 안내합니다.",
+            colour=0x57F287,
+        )
+        embed.add_field(
+            name="v1.0.1 · 2026-08-31",
+            value=(
+                "• 내전 취소·종료·모집 마감의 PostgreSQL 시간 타입 오류 수정\n"
+                "• 동적 보이스 채널 정리 예정 시각 처리 보완\n"
+                "• `/내전 사용법`, `/내전 패치내역` 추가\n"
+                "• 생성자의 1·2지망을 필수 입력으로 변경"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="v1.0.0 · 2026-08-26 · 정식 릴리즈",
+            value=(
+                "• 내전 모집·참가·대기열·준비·팀 배정·결과·취소\n"
+                "• 게임별 시즌·MMR·전적·랭킹과 LoL 라인별 MMR\n"
+                "• Balanced·Draft 배정 및 보이스 채널 자동 관리\n"
+                "• 관리자 권한, 마감 처리와 재시작 복구"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="전체 내용은 저장소의 CHANGELOG.md에서 확인하세요.")
+        await self._send_embed(interaction, embed)
+
     @app_commands.command(name="생성", description="새 내전을 생성합니다.")
     @app_commands.describe(
         title="내전 제목", recruitment_minutes="모집시간(분)", game="게임",
@@ -199,11 +233,11 @@ class MatchCommandGroup(app_commands.Group):
         self,
         interaction: discord.Interaction,
         title: str,
+        preferred_role_1: app_commands.Choice[str],
+        preferred_role_2: app_commands.Choice[str],
         recruitment_minutes: app_commands.Range[int, 5, 1440] | None = None,
         game: str | None = None,
         assignment_mode: app_commands.Choice[str] | None = None,
-        preferred_role_1: app_commands.Choice[str] | None = None,
-        preferred_role_2: app_commands.Choice[str] | None = None,
         preferred_role_3: app_commands.Choice[str] | None = None,
     ) -> None:
         if interaction.guild is None or interaction.channel is None:

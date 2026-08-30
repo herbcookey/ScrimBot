@@ -190,8 +190,9 @@ def test_phase3b_command_options_and_names():
 
     mode = MatchCommandGroup.create._params["assignment_mode"]
     assert mode.required is False and mode.default is None
-    assert MatchCommandGroup.create._params["preferred_role_1"].required is False
-    assert MatchCommandGroup.create._params["preferred_role_2"].required is False
+    assert MatchCommandGroup.create._params["preferred_role_1"].required is True
+    assert MatchCommandGroup.create._params["preferred_role_2"].required is True
+    assert MatchCommandGroup.create._params["preferred_role_3"].required is False
     assert MatchCommandGroup.ranking._params["role"].required is False
     assert MatchCommandGroup.set_mmr.name == "mmr설정"
     assert MatchCommandGroup.set_mmr._params["game"].autocomplete is not None
@@ -229,10 +230,35 @@ async def test_usage_command_sends_ephemeral_command_guide():
         "/내전 시즌시작",
         "/내전 mmr설정",
         "/내전 관리자목록",
+        "/내전 패치내역",
     ):
         assert command in guide
     assert "선택할 모든 지망" in guide
+    assert "생성자는 1·2지망을 반드시 선택" in guide
     assert "모집/준비 확인 중" in guide
+
+
+@pytest.mark.asyncio
+async def test_patch_notes_command_sends_ephemeral_version_history():
+    from inhouse_bot import __version__
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    group = MatchCommandGroup(SimpleNamespace())
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+
+    await MatchCommandGroup.patch_notes.callback(group, interaction)
+
+    assert MatchCommandGroup.patch_notes.name == "패치내역"
+    kwargs = interaction.followup.send.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    embed = kwargs["embed"]
+    assert __version__ == "1.0.1"
+    assert embed.title == "내전 봇 패치 내역 · v1.0.1"
+    history = "\n".join(f"{field.name}\n{field.value}" for field in embed.fields)
+    assert "v1.0.1" in history
+    assert "v1.0.0" in history
+    assert "정식 릴리즈" in history
+    assert "시간 타입 오류 수정" in history
 
 
 def _command_interaction(*, channel_type=None, manage_guild=False, guild=True):
