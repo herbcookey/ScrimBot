@@ -254,12 +254,14 @@ async def test_patch_notes_command_sends_ephemeral_version_history():
     kwargs = interaction.followup.send.await_args.kwargs
     assert kwargs["ephemeral"] is True
     embed = kwargs["embed"]
-    assert __version__ == "1.0.1"
-    assert embed.title == "내전 봇 패치 내역 · v1.0.1"
+    assert __version__ == "1.0.2"
+    assert embed.title == "내전 봇 패치 내역 · v1.0.2"
     history = "\n".join(f"{field.name}\n{field.value}" for field in embed.fields)
+    assert "v1.0.2" in history
     assert "v1.0.1" in history
     assert "v1.0.0" in history
     assert "정식 릴리즈" in history
+    assert "패널 자동 복구" in history
     assert "시간 타입 오류 수정" in history
 
 

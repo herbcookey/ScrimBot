@@ -194,6 +194,16 @@ class MatchCommandGroup(app_commands.Group):
             colour=0x57F287,
         )
         embed.add_field(
+            name="v1.0.2 · 2026-08-31",
+            value=(
+                "• 모집·준비·Draft 마감 처리와 진행 상태 검증 강화\n"
+                "• 패널 자동 복구와 모집 알림 실패 재시도 추가\n"
+                "• MMR 0~10000 범위 및 라인 게임 5:5 검증\n"
+                "• Discord 서버·입력·보이스 채널 검증과 사용자 안내 개선"
+            ),
+            inline=False,
+        )
+        embed.add_field(
             name="v1.0.1 · 2026-08-31",
             value=(
                 "• 내전 취소·종료·모집 마감의 PostgreSQL 시간 타입 오류 수정\n"
