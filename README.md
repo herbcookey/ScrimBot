@@ -18,7 +18,7 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 - `bot`
 - `applications.commands`
 
-봇 권한은 사용할 채널에 `View Channel`, `Send Messages`, `Embed Links`, `Read Message History`를 부여합니다. 음성 자동 배치를 사용할 때는 기존 A/B 음성 채널에 `Connect`, `Move Members`도 부여합니다. 음성 채널을 자동으로 생성하거나 삭제하지 않으며, `Administrator`는 부여하지 마세요.
+봇 권한은 사용할 채널에 `View Channel`, `Send Messages`, `Embed Links`, `Read Message History`를 부여합니다. 고정 A/B 음성 채널을 사용할 때는 해당 채널에 `Connect`, `Move Members`도 부여합니다. `INHOUSE_VOICE_CATEGORY_ID`로 동적 채널을 사용할 때는 해당 카테고리에 `Manage Channels`, `View Channel`, `Connect`, `Move Members`가 필요합니다. `Administrator`는 부여하지 마세요.
 
 이 봇은 슬래시 명령과 버튼 interaction을 사용하므로 `MESSAGE_CONTENT` 또는 `GUILD_MEMBERS` privileged intent가 필요 없습니다. 음성 자동 배치에는 `voice_states` intent만 사용합니다. Developer Portal의 **Bot → Privileged Gateway Intents → Message Content Intent**와 **Server Members Intent**는 끄고, 토큰을 일반 메시지 수집용으로 사용하지 마세요. `DISCORD_GUILD_ID`가 가리키는 서버에 길드 명령을 동기화하므로 다른 서버를 시험할 때는 해당 ID와 초대 대상을 함께 바꿔야 합니다.
 
@@ -54,6 +54,7 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 | `DATABASE_URL` | 앱이 사용할 PostgreSQL 연결 문자열. |
 | `TEST_DATABASE_URL` | PostgreSQL 통합 테스트 전용 연결 문자열. 앱 실행에는 쓰지 않습니다. |
 | `READY_TIMEOUT_SECONDS` | 준비 확인 제한 시간(초). 기본값 `120`. |
+| `DRAFT_TIMEOUT_SECONDS` | Draft에서 각 지명을 기다리는 제한 시간(초). 기본값 `120`. |
 | `DEFAULT_RECRUITMENT_MINUTES` | `/내전 생성` 모집시간 기본값(분, 5~1440). 기본값 `30`. |
 | `REMINDER_BEFORE_SECONDS` | 모집 마감 전 채널 알림 시점(초). 기본값 `300`(5분). |
 | `TEAM_A_VOICE_CHANNEL_ID` | 기존 A팀 음성 채널 ID. B와 함께 설정할 때만 자동 배치 활성화. 기본값 빈 값(비활성). |
@@ -110,19 +111,19 @@ LoL은 탑, 정글, 미드, 원딜, 서폿 점수를 따로 씁니다. 라인 ro
 
 기본 방식 `Balanced`는 양 팀에 다섯 라인을 한 명씩 채웁니다. 먼저 전체 지망 비용을 줄이고, 다음으로 팀 MMR 차이, 가장 큰 맞라인 차이, 맞라인 차이 합계를 비교합니다. 같은 입력과 match ID면 결과도 같습니다.
 
-`Draft`는 준비가 다 끝나면 `DRAFTING`으로 갑니다. 양수 라인 평균이 높은 두 명이 주장이고 A-B-B-A-A-B-B-A 순서로 지명합니다. 지명 때문에 마지막 라인 구성이 불가능해지면 그 지명은 저장하지 않습니다. 마지막 지명 뒤 팀 안에서 라인을 정하고 그때 점수를 스냅샷으로 남깁니다.
+`Draft`는 준비가 다 끝나면 `DRAFTING`으로 갑니다. 양수 라인 평균이 높은 두 명이 주장이고 A-B-B-A-A-B-B-A 순서로 지명합니다. 각 지명에는 `DRAFT_TIMEOUT_SECONDS` 제한이 적용되고, 시간이 지나면 내전이 자동 취소됩니다. 지명 때문에 마지막 라인 구성이 불가능해지면 그 지명은 저장하지 않습니다. 마지막 지명 뒤 팀 안에서 라인을 정하고 그때 점수를 스냅샷으로 남깁니다.
 
 결과 저장 때는 실제 `assigned_role` 한 줄만 갱신합니다. 글로벌 `player_ratings`에는 같이 반영하지 않습니다. 라인 기능이 꺼진 다른 게임은 기존 3A 글로벌 MMR 흐름 그대로 갑니다.
 
 ## 모집 알림·만료와 재시작 복구
 
-`/내전 생성` 시 모집 마감 시각을 저장하고 카드에 Discord timestamp로 표시합니다. 기본값은 마감 5분 전이며 `REMINDER_BEFORE_SECONDS`로 초 단위 설정을 바꿀 수 있습니다. 전체 모집 시간이 알림 시점보다 짧으면 사전 알림을 생략하고, DM은 보내지 않습니다. `recruitment_reminded_at`으로 중복 알림을 막습니다.
+`/내전 생성` 시 모집 마감 시각을 저장하고 카드에 Discord timestamp로 표시합니다. 기본값은 마감 5분 전이며 `REMINDER_BEFORE_SECONDS`로 초 단위 설정을 바꿀 수 있습니다. 전체 모집 시간이 알림 시점보다 짧으면 사전 알림을 생략하고, DM은 보내지 않습니다. 알림은 DB claim과 성공 확인을 사용하며 Discord 전송이 실패하면 다음 폴링에서 다시 시도합니다.
 
 모집 마감 시 트랜잭션 안에서 상태와 시각을 다시 확인합니다. 정원이 차 있으면 `READY_CHECK`를 시작하고, 부족하면 `CANCELLED`(사유: 모집 시간 만료)로 종료하며 `ended_at`을 저장하고 버튼을 비활성화합니다. 준비 시간이 만료되면 미준비자를 제거하고 FIFO 대기자를 승격한 뒤, 정원이 차면 새 `READY_CHECK`, 부족하면 `RECRUITING`으로 돌립니다. 이 과정에서 제거·승격 결과를 채널에 알립니다.
 
-예약 작업은 별도 큐 없이 단일 background task가 약 10~15초마다 한 번 폴링합니다. `process_due_matches(now)`처럼 현재 시각을 받는 함수로 모집 알림·모집 만료·준비 만료를 처리하며, 실행 전 DB 상태와 기한을 재검사하고 여러 번 실행해도 중복 전이가 없도록 멱등 처리합니다. DB 트랜잭션을 Discord API 호출보다 먼저 커밋하므로 API 실패가 상태 변경을 되돌리지 않습니다.
+예약 작업은 별도 큐 없이 단일 background task가 약 10~15초마다 한 번 폴링합니다. `process_due_matches(now)`처럼 현재 시각을 받는 함수로 모집 알림·모집 만료·준비 만료·Draft 만료를 처리하며, 실행 전 DB 상태와 기한을 재검사하고 여러 번 실행해도 중복 전이가 없도록 멱등 처리합니다. DB 트랜잭션을 Discord API 호출보다 먼저 커밋하므로 API 실패가 상태 변경을 되돌리지 않습니다.
 
-재시작 시 `RECRUITING`, `READY_CHECK`, `DRAFTING`, `PLAYING`을 조회해 Persistent View와 최신 카드를 다시 등록하고, 이미 지난 마감은 즉시 처리하며 남은 마감은 폴링이 이어서 처리합니다. 이미 `recruitment_reminded_at`이 있는 경기에는 알림을 다시 보내지 않습니다. `PLAYING`은 DB에 저장된 카테고리와 채널 ID를 다시 확인하고 빠진 채널만 복구합니다. 정리 시간이 지난 종료 경기 처리도 다시 시작합니다.
+재시작 시 `RECRUITING`, `READY_CHECK`, `DRAFTING`, `PLAYING`을 조회해 Persistent View와 최신 카드를 다시 등록하고, 삭제됐거나 ID가 누락된 활성 내전 패널은 기존 패널을 찾아 연결하거나 새로 게시합니다. 이미 지난 마감은 즉시 처리하고, 전송에 실패한 모집 알림과 남은 마감은 폴링이 이어서 처리합니다. `PLAYING`은 DB에 저장된 카테고리와 채널 ID를 다시 확인하고 빠진 채널만 복구합니다. 정리 시간이 지난 종료 경기 처리도 다시 시작합니다.
 
 ## 보이스 채널 자동 생성과 배치
 
@@ -206,7 +207,7 @@ supabase db push
 - Discord 메시지가 삭제되거나 오래된 경우 메시지 내용을 수동으로 진실로 취급하지 말고 DB 행을 확인한 뒤 패널을 다시 게시·갱신합니다. migration은 스키마만 바꾸며 참가자/결과를 복구하지 않습니다.
 - 운영 DB에 migration 또는 수동 SQL을 실행하기 전 Supabase 백업/`pg_dump`를 확보합니다. 장애 시 봇을 중지하고 백업과 DB 상태를 확인한 다음 필요한 행을 복구하고 재시작합니다.
 - `RECRUITING` 중에는 생성자도 `나가기`를 누를 수 있습니다. 이때 참가자 행만 나가고 `matches.creator_id`는 유지하므로 생성자의 관리 권한(시작·취소·결과 기록)은 사라지지 않습니다. `PLAYING`에서는 나갈 수 없습니다.
-- 이 봇은 단일 프로세스 폴링 작업이며 Outbox나 분산 작업 큐를 사용하지 않습니다. 프로세스 중단·재시작 또는 Discord 장애 시 모집 reminder가 유실될 수 있으므로 로그와 카드의 마감 시각을 운영자가 확인해야 합니다. DB 상태는 Discord 메시지 편집·음성 이동 실패로 롤백되지 않으며, API 실패는 로그에 남긴 뒤 재시작 복구나 수동 카드 갱신으로 대응합니다.
+- 이 봇은 단일 프로세스 폴링 작업이며 분산 작업 큐를 사용하지 않습니다. 모집 알림은 DB claim·성공 확인·재시도로 유실을 줄이고, 활성 패널은 재시작과 주기 복구에서 다시 연결하거나 게시합니다. Discord가 알림을 받은 직후 성공 확인 전에 프로세스가 종료되면 같은 알림이 다시 전송될 수 있습니다. DB 상태는 Discord 메시지 편집·음성 이동 실패로 롤백되지 않으며 API 실패는 로그와 복구 작업으로 대응합니다.
 
 ## 테스트
 

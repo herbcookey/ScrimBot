@@ -236,8 +236,14 @@ async def test_usage_command_sends_ephemeral_command_guide():
     ):
         assert command in guide
     assert "선택할 모든 지망" in guide
-    assert "생성자는 1·2지망을 반드시 선택" in guide
+    assert "1·2지망을 반드시 선택" in guide
+    assert "생성자는 자동으로 참가" in guide
     assert "모집/준비 확인 중" in guide
+    assert "모집·준비 마감 이후" in guide
+    assert "지명 마감까지 선택하지 않으면 내전이 자동 취소" in guide
+    assert "패널과 실패한 모집 알림" in embed.footer.text
+    assert all(len(field.value) <= 1024 for field in embed.fields)
+    assert len(embed) <= 6000
 
 
 @pytest.mark.asyncio
