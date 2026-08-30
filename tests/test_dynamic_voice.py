@@ -386,3 +386,56 @@ async def test_not_found_is_success_and_closed_channel_is_not_recreated(monkeypa
     await voice.ensure_match_voice_channels(service, guild, match)
     assert all(created[0].name != "104번째 내전 1팀" for created in guild.created)
     assert match.team_b_voice_channel_id == channel_b.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ("missing", "wrong_type", "foreign", "permission"))
+async def test_fixed_voice_channels_return_explicit_configuration_errors(case, monkeypatch):
+    guild = _Guild()
+    category = guild.add_category()
+    channel_a = guild.add_voice(50, "고정 1팀", category)
+    channel_b = guild.add_voice(51, "고정 2팀", category)
+    match = _match()
+
+    if case == "missing":
+        guild._channels.pop(51)
+    elif case == "wrong_type":
+        class _Text:
+            def __init__(self, channel_id, owner_guild):
+                self.id = channel_id
+                self.guild = owner_guild
+        guild._channels[51] = _Text(51, guild)
+    elif case == "foreign":
+        foreign = _Guild()
+        foreign.id = 2
+        foreign_category = foreign.add_category(20)
+        guild._channels[51] = foreign.add_voice(51, "고정 2팀", foreign_category)
+    else:
+        class _NoMove(type(channel_a)):
+            def permissions_for(self, _member):
+                return SimpleNamespace(connect=True, move_members=False)
+        replacement = _NoMove(channel_a.id, channel_a.name, guild, category)
+        guild._channels[50] = replacement
+
+    result = await voice.move_match_participants(guild, match, 50, 51)
+
+    assert result.error
+    assert "보이스" in result.error
+    assert not channel_a.members
+    assert not channel_b.members
+
+
+@pytest.mark.asyncio
+async def test_dynamic_same_name_unowned_channel_is_not_adopted():
+    guild = _Guild()
+    category = guild.add_category()
+    unowned = guild.add_voice(77, "104번째 내전 1팀", category)
+    unowned.bot_owned = False
+    match = _match()
+    service = _Service(match)
+
+    result = await voice.ensure_match_voice_channels(service, guild, match)
+
+    assert result.error is None
+    assert result.team_a_channel_id != unowned.id
+    assert result.team_a_channel_id in result.created_channel_ids

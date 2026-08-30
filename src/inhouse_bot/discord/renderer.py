@@ -181,6 +181,9 @@ def render_match(match: Any) -> discord.Embed:
         embed.add_field(
             name="미지명", value=_roster(unpicked, show_preferences=True), inline=False
         )
+        deadline = _get(match, "draft_deadline_at")
+        if deadline is not None:
+            embed.add_field(name="지명 마감", value=_deadline_value(deadline), inline=False)
     elif status == "PLAYING":
         for team in ("A", "B"):
             members = [item for item in players if _participant_team(item) == team]

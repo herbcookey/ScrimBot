@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from inhouse_bot.repositories.matches import (
+    InvalidMatchStateError,
     InvalidRolePreferencesError,
     PermissionDeniedError,
     RoleRatingAlreadyExistsError,
@@ -178,3 +179,49 @@ async def test_draft_state_captains_snake_lock_and_recovery(service_and_scope):
     assert match.status == "PLAYING" and match.draft_pick_index == 8
     for team in ("A", "B"):
         assert {item.assigned_role for item in match.participants if item.team == team} == set(ROLES)
+
+
+@pytest.mark.asyncio
+async def test_draft_timeout_cancels_and_is_idempotent(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    preferences = {
+        user_id: (ROLES[(user_id - 1) % 5], ROLES[user_id % 5])
+        for user_id in range(60001, 60011)
+    }
+    await service.start_season(guild_id, "Draft 만료 테스트", manager_override=True, now=T0)
+    for user_id, roles in preferences.items():
+        for role in roles:
+            await service.set_role_rating(
+                guild_id, user_id, role, rating=1500,
+                manager_override=True, now=T0,
+            )
+    match = await service.create_match(
+        guild_id, channel_id, 60001, "Draft 만료", assignment_mode="DRAFT",
+        preferred_role_1=preferences[60001][0],
+        preferred_role_2=preferences[60001][1], now=T0,
+    )
+    for user_id in range(60002, 60011):
+        match = await service.join_match(
+            match.id, user_id,
+            preferred_role_1=preferences[user_id][0],
+            preferred_role_2=preferences[user_id][1], now=T0,
+        )
+    await service.start_match(match.id, 60001, now=T0)
+    for user_id in range(60001, 60011):
+        match = await service.toggle_ready(match.id, user_id, now=T0)
+    assert match.status == "DRAFTING"
+    deadline = match.draft_deadline_at
+    assert deadline == T0 + timedelta(seconds=120)
+    captain = match.captain_a_id
+    target = next(item.user_id for item in match.participants if item.team is None)
+    with pytest.raises(InvalidMatchStateError):
+        await service.draft_pick(match.id, captain, target, now=deadline)
+
+    events = await service.process_due_matches(now=deadline)
+    assert len(events) == 1 and events[0].kind == "draft_expired"
+    cancelled = await service.get_match(match.id)
+    assert cancelled.status == "CANCELLED"
+    assert cancelled.cancel_reason == "지명 시간 만료"
+    assert cancelled.ended_at == deadline
+    assert cancelled.draft_deadline_at is None
+    assert await service.process_due_matches(now=deadline) == []

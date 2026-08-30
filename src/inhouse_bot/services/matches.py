@@ -14,6 +14,8 @@ from inhouse_bot.repositories.matches import (
     BotAdminNotFoundError,
     BotOwnerProtectedError,
     CANCELLED,
+    DEFAULT_DRAFT_TIMEOUT_SECONDS,
+    DEFAULT_REMINDER_RETRY_SECONDS,
     DRAFTING,
     FINISHED,
     Game,
@@ -51,6 +53,33 @@ from inhouse_bot.repositories.matches import (
 )
 
 
+# These values mirror the Discord fields produced by ``render_match``.  The
+# service validates them before calling the repository so callers other than
+# slash-command interactions cannot persist text Discord would reject.
+MATCH_TITLE_MAX_LENGTH = 4096
+RESULT_MEMO_MAX_LENGTH = 1024
+
+
+def _validate_embed_text(
+    value: str | None,
+    *,
+    field: str,
+    max_length: int,
+    allow_empty: bool = True,
+) -> str | None:
+    if value is None:
+        if not allow_empty:
+            raise ValueError(f"{field}을 입력해 주세요.")
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field}은 문자열이어야 합니다.")
+    if not allow_empty and not value.strip():
+        raise ValueError(f"{field}을 입력해 주세요.")
+    if len(value) > max_length:
+        raise ValueError(f"{field}은 {max_length}자 이내로 입력해 주세요.")
+    return value
+
+
 class MatchService:
     """내전 저장소를 호출하는 얇은 서비스."""
 
@@ -60,8 +89,10 @@ class MatchService:
         *,
         bot_owner_id: int,
         ready_timeout_seconds: int = 120,
+        draft_timeout_seconds: int = DEFAULT_DRAFT_TIMEOUT_SECONDS,
         default_recruitment_minutes: int = 30,
         reminder_before_seconds: int = 300,
+        reminder_retry_seconds: int = DEFAULT_REMINDER_RETRY_SECONDS,
         voice_cleanup_delay_seconds: int = 600,
     ) -> None:
         self.repository = MatchRepository(pool)
@@ -69,8 +100,10 @@ class MatchService:
         if self.bot_owner_id <= 0:
             raise ValueError("bot_owner_id는 양의 정수여야 합니다")
         self.ready_timeout_seconds = int(ready_timeout_seconds)
+        self.draft_timeout_seconds = int(draft_timeout_seconds)
         self.default_recruitment_minutes = int(default_recruitment_minutes)
         self.reminder_before_seconds = int(reminder_before_seconds)
+        self.reminder_retry_seconds = int(reminder_retry_seconds)
         self.voice_cleanup_delay_seconds = int(voice_cleanup_delay_seconds)
 
     async def is_bot_owner(self, user_id: int) -> bool:
@@ -115,6 +148,12 @@ class MatchService:
         recruitment_minutes: int | None = None,
         now: datetime | None = None,
     ) -> Match:
+        title = _validate_embed_text(
+            title,
+            field="제목",
+            max_length=MATCH_TITLE_MAX_LENGTH,
+            allow_empty=False,
+        )
         return await self.repository.create_match(
             guild_id,
             channel_id,
@@ -214,13 +253,16 @@ class MatchService:
         )
 
     async def toggle_ready(self, match_id: int, user_id: int, *, now: datetime | None = None) -> Match:
-        return await self.repository.toggle_ready(match_id, user_id, now=now)
+        return await self.repository.toggle_ready(
+            match_id, user_id, now=now, draft_timeout_seconds=self.draft_timeout_seconds
+        )
 
     async def draft_pick(
         self, match_id: int, actor_id: int, target_user_id: int, *, now: datetime | None = None
     ) -> Match:
         return await self.repository.draft_pick(
-            match_id, actor_id, target_user_id, now=now
+            match_id, actor_id, target_user_id, now=now,
+            draft_timeout_seconds=self.draft_timeout_seconds,
         )
 
     async def kick_match_member(
@@ -270,6 +312,11 @@ class MatchService:
         manager_override: bool = False,
         now: datetime | None = None,
     ) -> Match:
+        memo = _validate_embed_text(
+            memo,
+            field="결과 메모",
+            max_length=RESULT_MEMO_MAX_LENGTH,
+        )
         return await self.repository.finish_match(
             match_id,
             actor_id,
@@ -374,6 +421,7 @@ class MatchService:
             ready_timeout_seconds=self.ready_timeout_seconds,
             default_recruitment_minutes=self.default_recruitment_minutes,
             reminder_before_seconds=self.reminder_before_seconds,
+            reminder_retry_seconds=self.reminder_retry_seconds,
         )
 
     async def get_match(self, match_id: int) -> Match | None:
@@ -434,6 +482,38 @@ class MatchService:
     async def update_message_id(self, match_id: int, message_id: int | None) -> Match:
         return await self.repository.update_message_id(match_id, message_id)
 
+    async def attach_message_id(
+        self,
+        match_id: int,
+        message_id: int,
+        *,
+        expected_old: int | None = None,
+    ) -> Match:
+        return await self.repository.attach_message_id(
+            match_id, message_id, expected_old=expected_old
+        )
+
+    async def acknowledge_recruitment_reminder(
+        self,
+        match_id: int,
+        token: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        return await self.repository.acknowledge_recruitment_reminder(
+            match_id, token, now=now
+        )
+
+    async def retry_recruitment_reminder(
+        self,
+        match_id: int,
+        token: str,
+        retry_at: datetime,
+    ) -> bool:
+        return await self.repository.retry_recruitment_reminder(
+            match_id, token, retry_at
+        )
+
     async def cancel_missing_message(self, match_id: int) -> Match:
         return await self.repository.cancel_missing_message(
             match_id,
@@ -443,6 +523,8 @@ class MatchService:
 
 
 __all__ = [
+    "MATCH_TITLE_MAX_LENGTH",
+    "RESULT_MEMO_MAX_LENGTH",
     "ACTIVE_STATUSES",
     "ActiveMatchExistsError",
     "ActiveMembershipError",

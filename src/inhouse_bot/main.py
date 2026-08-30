@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import discord
@@ -78,6 +79,7 @@ class InhouseBot(commands.Bot):
                 self.pool,
                 bot_owner_id=self.settings.bot_owner_id,
                 ready_timeout_seconds=self.settings.ready_timeout_seconds,
+                draft_timeout_seconds=self.settings.draft_timeout_seconds,
                 default_recruitment_minutes=self.settings.default_recruitment_minutes,
                 reminder_before_seconds=self.settings.reminder_before_seconds,
                 voice_cleanup_delay_seconds=self.settings.voice_cleanup_delay_seconds,
@@ -151,8 +153,164 @@ class InhouseBot(commands.Bot):
                 await self._handle_due_event(event)
             except Exception:
                 logger.exception("만료 내전 알림 전송 실패", extra={"match_id": _get(event, "match_id")})
+        await self._repair_panel_less_matches()
         await self.process_voice_cleanups()
         return events
+
+    def _match_view(self, match: Any, *, disabled: bool = False) -> MatchView:
+        """Construct a view with persisted guild/mode metadata.
+
+        Recovery can run after a process restart, so the view must not infer
+        authorization from the channel or from stale constructor defaults.
+        """
+
+        return MatchView(
+            self.service,
+            int(_get(match, "id")),
+            status=str(_get(match, "status", "")),
+            disabled=disabled,
+            guild_id=_get(match, "guild_id"),
+            role_rating_enabled=_get(match, "role_rating_enabled"),
+            team_a_voice_channel_id=self.settings.team_a_voice_channel_id,
+            team_b_voice_channel_id=self.settings.team_b_voice_channel_id,
+        )
+
+    @staticmethod
+    def _is_match_panel(message: Any, match_id: int) -> bool:
+        """Recognize a previously posted panel without relying on its text."""
+
+        target = f"match:{int(match_id)}:join"
+        for row in getattr(message, "components", ()) or ():
+            children = getattr(row, "children", None)
+            for component in children if children is not None else (row,):
+                if getattr(component, "custom_id", None) == target:
+                    return True
+        content = str(getattr(message, "content", "") or "")
+        return f"match:{int(match_id)}" in content
+
+    async def _find_existing_panel(self, channel: Any, match_id: int) -> Any | None:
+        history = getattr(channel, "history", None)
+        if not callable(history):
+            return None
+        try:
+            stream = history(limit=50)
+            if hasattr(stream, "__await__"):
+                stream = await stream
+            if hasattr(stream, "__aiter__"):
+                async for message in stream:
+                    if self._is_match_panel(message, match_id):
+                        return message
+            else:
+                for message in stream or ():
+                    if self._is_match_panel(message, match_id):
+                        return message
+        except (TypeError, AttributeError):
+            # Minimal test doubles and channels without history support are
+            # handled by the normal send path.
+            return None
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("내전 패널 기록 조회 실패", extra={"match_id": match_id})
+        return None
+
+    async def _attach_panel_id(
+        self, match_id: int, message_id: int, *, expected_old: int | None = None
+    ) -> Any:
+        attach = getattr(self.service, "attach_message_id", None)
+        if callable(attach):
+            return await attach(match_id, message_id, expected_old=expected_old)
+        # Compatibility for a service object created before the recovery API.
+        return await self.service.update_message_id(match_id, message_id)
+
+    async def _ensure_match_panel(
+        self, match: Any, *, refresh: bool = True
+    ) -> Any | None:
+        """Find, repair, or post the panel for one active DB match.
+
+        The database remains the source of truth.  A failed Discord call is
+        deliberately allowed to bubble to the caller so the active row stays
+        panel-less and can be retried later rather than being cancelled.
+        """
+
+        if self.service is None:
+            return None
+        match_id = int(_get(match, "id", _get(match, "match_id", 0)))
+        latest = await self.service.get_match(match_id)
+        if latest is None:
+            return None
+        channel_id = _get(latest, "channel_id")
+        if channel_id is None:
+            return latest
+        channel = await self._channel_for(int(channel_id))
+        if channel is None:
+            return latest
+        message_id = _get(latest, "message_id")
+        message = None
+        if message_id:
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except discord.NotFound:
+                message = None
+            except (discord.Forbidden, discord.HTTPException):
+                raise
+            # A stale/non-NULL ID can point to an unrelated message after a
+            # channel cleanup or manual edit.  Never overwrite that message;
+            # search for this match's fingerprint and publish a replacement.
+            if message is not None and not self._is_match_panel(message, match_id):
+                message = None
+        if message is None:
+            # A crash can happen after Discord accepted a send but before the
+            # ID was committed. Adopt an existing component-bearing panel
+            # before posting another one.
+            message = await self._find_existing_panel(channel, match_id)
+            if message is not None:
+                await self._attach_panel_id(
+                    match_id,
+                    int(_get(message, "id")),
+                    expected_old=int(message_id) if message_id else None,
+                )
+                latest = await self.service.get_match(match_id) or latest
+        if message is None:
+            latest = await self.service.get_match(match_id) or latest
+            message = await _safe_send(
+                channel,
+                "",
+                embed=render_match(latest),
+                view=self._match_view(
+                    latest,
+                    disabled=str(_get(latest, "status", "")) in {"FINISHED", "CANCELLED"},
+                ),
+            )
+            await self._attach_panel_id(
+                match_id,
+                int(_get(message, "id")),
+                expected_old=int(message_id) if message_id else None,
+            )
+            latest = await self.service.get_match(match_id) or latest
+        elif refresh:
+            latest = await self.service.get_match(match_id) or latest
+            await _safe_edit(
+                message,
+                embed=render_match(latest),
+                view=self._match_view(
+                    latest,
+                    disabled=str(_get(latest, "status", "")) in {"FINISHED", "CANCELLED"},
+                ),
+            )
+        return latest
+
+    async def _repair_panel_less_matches(self) -> None:
+        """Retry active rows whose panel is missing or points at stale data."""
+
+        if self.service is None:
+            return
+        for match in await self.service.list_active():
+            try:
+                # Verify known IDs too: Discord can delete a panel while the
+                # database still contains its ID.  A valid panel needs no
+                # edit here; ordinary state transitions refresh it elsewhere.
+                await self._ensure_match_panel(match, refresh=False)
+            except Exception:
+                logger.exception("패널 없는 내전 복구 실패", extra={"match_id": _get(match, "id")})
 
     async def process_voice_cleanups(self) -> None:
         if self.service is None:
@@ -189,17 +347,17 @@ class InhouseBot(commands.Bot):
             return latest
         try:
             message = await channel.fetch_message(int(message_id))
-            status = str(_get(latest, "status", ""))
+            if not self._is_match_panel(message, match_id):
+                # Do not let a stale ID overwrite an unrelated message.  The
+                # recovery path adopts/reposts a panel with the right custom ID.
+                await self._ensure_match_panel(latest)
+                return latest
             await _safe_edit(
                 message,
                 embed=render_match(latest),
-                view=MatchView(
-                    self.service,
-                    match_id,
-                    status=status,
-                    disabled=status in {"FINISHED", "CANCELLED"},
-                    team_a_voice_channel_id=self.settings.team_a_voice_channel_id,
-                    team_b_voice_channel_id=self.settings.team_b_voice_channel_id,
+                view=self._match_view(
+                    latest,
+                    disabled=str(_get(latest, "status", "")) in {"FINISHED", "CANCELLED"},
                 ),
             )
         except (discord.Forbidden, discord.HTTPException, discord.NotFound):
@@ -212,6 +370,7 @@ class InhouseBot(commands.Bot):
         match = _get(event, "match", event)
         event_status = _get(match, "status")
         event_reminded_at = _get(match, "recruitment_reminded_at")
+        delivery_token = _get(event, "delivery_token")
         latest = await self._refresh_match(match)
         match = latest or match
         if latest is not None and str(_get(latest, "status")) != str(event_status):
@@ -221,14 +380,16 @@ class InhouseBot(commands.Bot):
             await close_empty_match_voice_channels(self.service, guild, match)
             match = await self.service.get_match(int(_get(match, "id"))) or match
         channel = await self._channel_for(int(_get(match, "channel_id")))
-        if channel is None:
-            return
         kind = str(_get(event, "kind", ""))
         creator_id = _get(match, "creator_id")
         prefix = f"<@{int(creator_id)}> " if creator_id is not None else ""
         if kind == "recruitment_reminder":
             if str(_get(match, "status")) != "RECRUITING" or _get(match, "recruitment_reminded_at") != event_reminded_at:
                 return
+            current_token = _get(match, "recruitment_reminder_token")
+            if delivery_token is not None and current_token is not None:
+                if str(current_token) != str(delivery_token):
+                    return
             deadline = _get(match, "recruitment_deadline_at")
             text = f"{prefix}{_reminder_text(self.settings.reminder_before_seconds)}입니다. 마감: {_timestamp(deadline)}"
         elif kind == "recruitment_expired":
@@ -244,9 +405,56 @@ class InhouseBot(commands.Bot):
                 text += " 제외: " + ", ".join(f"<@{int(user_id)}>" for user_id in removed)
             if promoted:
                 text += " 승격: " + ", ".join(f"<@{int(user_id)}>" for user_id in promoted)
+        elif kind == "draft_expired":
+            text = f"{prefix}지명 시간이 만료되어 내전이 취소되었습니다."
         else:
             return
+        if channel is None:
+            if kind == "recruitment_reminder" and delivery_token is not None:
+                await self._retry_recruitment_reminder(int(_get(match, "id")), str(delivery_token))
+            return
+        if kind == "recruitment_reminder" and delivery_token is not None:
+            try:
+                await _safe_send(channel, text)
+            except Exception:
+                await self._retry_recruitment_reminder(int(_get(match, "id")), str(delivery_token))
+                raise
+            try:
+                acknowledge = getattr(self.service, "acknowledge_recruitment_reminder", None)
+                if not callable(acknowledge):
+                    # Compatibility with a test/embedded service from before
+                    # durable reminder delivery was introduced.  Production
+                    # MatchService always provides this method.
+                    logger.warning(
+                        "모집 알림 ACK API가 없어 전달만 완료함",
+                        extra={"match_id": _get(match, "id")},
+                    )
+                    return
+                acknowledged = await acknowledge(
+                    int(_get(match, "id")), str(delivery_token)
+                )
+            except Exception:
+                await self._retry_recruitment_reminder(int(_get(match, "id")), str(delivery_token))
+                raise
+            if not acknowledged:
+                logger.info(
+                    "오래된 모집 알림 전달 토큰을 무시함",
+                    extra={"match_id": _get(match, "id")},
+                )
+            return
         await _safe_send(channel, text)
+
+    async def _retry_recruitment_reminder(self, match_id: int, token: str) -> None:
+        retry = getattr(self.service, "retry_recruitment_reminder", None)
+        if not callable(retry):
+            return
+        retry_at = datetime.now(timezone.utc) + timedelta(
+            seconds=max(1, int(getattr(self.service, "reminder_retry_seconds", 60)))
+        )
+        try:
+            await retry(match_id, token, retry_at)
+        except Exception:
+            logger.exception("모집 알림 재시도 예약 실패", extra={"match_id": match_id})
 
     async def recover_active_matches(self) -> None:
         if self.service is None:
@@ -288,50 +496,28 @@ class InhouseBot(commands.Bot):
                                         f"{summary.error} 경기와 팀 배정은 DB에 저장되어 있습니다.",
                                     )
                             match = await self.service.get_match(match_id) or match
-                    view = MatchView(
-                        self.service,
-                        match_id,
-                        status=status,
-                        team_a_voice_channel_id=self.settings.team_a_voice_channel_id,
-                        team_b_voice_channel_id=self.settings.team_b_voice_channel_id,
-                    )
-                    message_id = _get(match, "message_id")
-                    if message_id:
-                        self.add_view(view, message_id=int(message_id))
-                    else:
-                        self.add_view(view)
-                        logger.warning("활성 내전에 메시지 ID가 없음", extra={"match_id": match_id})
-                        continue
-                    channel = await self._channel_for(int(_get(match, "channel_id")))
-                    if channel is None:
-                        continue
+                    # Panel IDs can be NULL after a crash, or can point to a
+                    # deleted Discord message.  Re-adopt/repost the panel while
+                    # retaining the active DB row; transient Discord failures
+                    # are logged and retried by the next poll/startup pass.
                     try:
-                        message = await channel.fetch_message(int(message_id))
-                        latest = await self.service.get_match(match_id)
-                        if latest is not None:
-                            latest_status = str(_get(latest, "status", ""))
-                            await _safe_edit(
-                                message,
-                                embed=render_match(latest),
-                                view=MatchView(
-                                    self.service,
-                                    match_id,
-                                    status=latest_status,
-                                    disabled=latest_status in {"FINISHED", "CANCELLED"},
-                                    team_a_voice_channel_id=self.settings.team_a_voice_channel_id,
-                                    team_b_voice_channel_id=self.settings.team_b_voice_channel_id,
-                                ),
-                            )
-                    except discord.NotFound:
-                        logger.warning("활성 내전 메시지를 찾을 수 없음", extra={"match_id": match_id})
-                        try:
-                            await self.service.cancel_missing_message(match_id)
-                        except Exception:
-                            logger.exception("메시지가 없는 내전 취소 실패", extra={"match_id": match_id})
+                        repaired = await self._ensure_match_panel(match)
                     except (discord.Forbidden, discord.HTTPException, asyncio.TimeoutError):
                         logger.exception("내전 메시지 복구 실패", extra={"match_id": match_id})
+                        continue
                     except Exception:
                         logger.exception("활성 내전 복구 중 예상 못 한 오류", extra={"match_id": match_id})
+                        continue
+                    if repaired is None:
+                        continue
+                    message_id = _get(repaired, "message_id")
+                    if not message_id:
+                        logger.warning("활성 내전에 메시지 ID가 없음", extra={"match_id": match_id})
+                        continue
+                    try:
+                        self.add_view(self._match_view(repaired), message_id=int(message_id))
+                    except Exception:
+                        logger.exception("내전 버튼 뷰 등록 실패", extra={"match_id": match_id})
                 self._recovered = True
             except Exception:
                 logger.exception("복구할 활성 내전 조회 실패")

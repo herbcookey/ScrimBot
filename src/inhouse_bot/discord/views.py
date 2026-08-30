@@ -59,6 +59,8 @@ class MatchView(discord.ui.View):
         disabled: bool = False,
         status: str | None = None,
         state: str | None = None,
+        guild_id: int | None = None,
+        role_rating_enabled: bool | None = None,
         team_a_voice_channel_id: int | None = None,
         team_b_voice_channel_id: int | None = None,
     ) -> None:
@@ -67,6 +69,14 @@ class MatchView(discord.ui.View):
         self.match_id = int(match_id)
         status = status or state
         self.status = status
+        # Persist the guild and role-mode metadata on every newly rendered
+        # view.  The values are also supplied when the bot reconstructs a
+        # view after a restart; ``None`` is retained as a compatibility mode
+        # for older callers that do not yet provide the persisted fields.
+        self.guild_id = int(guild_id) if guild_id is not None else None
+        self.role_rating_enabled = (
+            bool(role_rating_enabled) if role_rating_enabled is not None else None
+        )
         self.team_a_voice_channel_id = team_a_voice_channel_id
         self.team_b_voice_channel_id = team_b_voice_channel_id
         self.join_button = discord.ui.Button(
@@ -127,10 +137,57 @@ class MatchView(discord.ui.View):
         except TypeError:
             await interaction.followup.send(content, ephemeral=True)
 
+    @staticmethod
+    def _interaction_guild_id(interaction: discord.Interaction) -> int | None:
+        guild = getattr(interaction, "guild", None)
+        guild_id = getattr(guild, "id", None)
+        return int(guild_id) if guild_id is not None else None
+
+    async def _match_for_interaction(self, interaction: discord.Interaction) -> Any:
+        """Load and validate the match's guild before any mutation or render.
+
+        Button interactions can be delivered from a different guild while an
+        old persistent view is still present.  Always compare the persisted
+        match guild with the interaction guild after the interaction has been
+        acknowledged.  A view created by an older process may not carry
+        ``guild_id``; in that case the loaded row supplies it and is cached on
+        the view for subsequent callbacks.
+        """
+
+        match = await self.service.get_match(self.match_id)
+        if match is None:
+            raise MatchError("내전을 찾을 수 없습니다.")
+        interaction_guild_id = self._interaction_guild_id(interaction)
+        match_guild_id = _get(match, "guild_id", self.guild_id)
+        if match_guild_id is not None:
+            match_guild_id = int(match_guild_id)
+            if self.guild_id is not None and self.guild_id != match_guild_id:
+                raise MatchError("내전 서버 정보가 일치하지 않습니다.")
+            self.guild_id = match_guild_id
+            if interaction_guild_id != match_guild_id:
+                raise MatchError("이 내전은 현재 서버에서 사용할 수 없습니다.")
+        elif interaction_guild_id is None:
+            # A guild-less interaction can never be safe for a persistent
+            # match.  Legacy test doubles without guild metadata are handled
+            # only when they do provide a guild context.
+            raise MatchError("서버에서만 내전 버튼을 사용할 수 있습니다.")
+        return match
+
+    def _known_guild_matches(self, interaction: discord.Interaction) -> bool:
+        """Synchronously check guild metadata already carried by the view."""
+
+        if self.guild_id is None:
+            return True
+        return self._interaction_guild_id(interaction) == self.guild_id
+
     async def _refresh(self, interaction: discord.Interaction) -> Any | None:
         latest = await self.service.get_match(self.match_id)
         if latest is None:
             return None
+        # Rendering is guarded by the same guild check as mutation.  This is
+        # especially important for stale persistent views whose interaction
+        # arrives from another server.
+        await self._match_for_interaction_from_loaded(interaction, latest)
         message = getattr(interaction, "message", None)
         if message is not None:
             terminal = str(_get(latest, "status", "")) in _TERMINAL
@@ -142,6 +199,10 @@ class MatchView(discord.ui.View):
                         self.service,
                         self.match_id,
                         status=str(_get(latest, "status", "")),
+                        guild_id=_get(latest, "guild_id", self.guild_id),
+                        role_rating_enabled=_get(
+                            latest, "role_rating_enabled", self.role_rating_enabled
+                        ),
                         team_a_voice_channel_id=self.team_a_voice_channel_id,
                         team_b_voice_channel_id=self.team_b_voice_channel_id,
                         disabled=terminal,
@@ -153,6 +214,28 @@ class MatchView(discord.ui.View):
                 # DB 변경은 이미 끝났다. 화면 수정 실패를 처리 실패로 보이면 안 된다.
                 logger.exception("내전 메시지 갱신 중 예상 못 한 오류", extra={"match_id": self.match_id})
         return latest
+
+    async def _match_for_interaction_from_loaded(
+        self, interaction: discord.Interaction, match: Any
+    ) -> Any:
+        """Validate a match row that has already been fetched.
+
+        ``_refresh`` has to avoid a second remote read, while callbacks still
+        need the persisted guild comparison immediately before rendering.
+        """
+
+        interaction_guild_id = self._interaction_guild_id(interaction)
+        match_guild_id = _get(match, "guild_id", self.guild_id)
+        if match_guild_id is not None:
+            match_guild_id = int(match_guild_id)
+            if self.guild_id is not None and self.guild_id != match_guild_id:
+                raise MatchError("내전 서버 정보가 일치하지 않습니다.")
+            self.guild_id = match_guild_id
+            if interaction_guild_id != match_guild_id:
+                raise MatchError("이 내전은 현재 서버에서 사용할 수 없습니다.")
+        elif interaction_guild_id is None:
+            raise MatchError("서버에서만 내전 버튼을 사용할 수 있습니다.")
+        return match
 
     async def _announce_mutation(self, interaction: discord.Interaction, result: Any) -> None:
         removed = _get(result, "removed_user_id")
@@ -206,8 +289,18 @@ class MatchView(discord.ui.View):
     ) -> None:
         await self._defer(interaction)
         try:
+            # ``get_match`` is remote, but the interaction is acknowledged
+            # above.  Never mutate before confirming this button belongs to
+            # the guild that owns the persisted match.
+            await self._match_for_interaction(interaction)
             result = await operation()
-            await self._refresh(interaction)
+            try:
+                await self._refresh(interaction)
+            except Exception:
+                # The DB mutation already committed.  A failed read/edit of
+                # the panel is a Discord refresh problem, not a failed join or
+                # leave operation; log it and still acknowledge success.
+                logger.exception("DB 반영 후 내전 메시지 갱신 실패", extra={"match_id": self.match_id})
             if after is not None:
                 try:
                     await after(result)
@@ -225,21 +318,33 @@ class MatchView(discord.ui.View):
 
     async def _join(self, interaction: discord.Interaction) -> None:
         user_id = int(interaction.user.id)
-        try:
-            match = await self.service.get_match(self.match_id)
-            if bool(_get(match, "role_rating_enabled", False)):
+        # Sending a modal must be the initial response.  The role-mode bit is
+        # carried by the persistent view, so opening it never waits on the
+        # database.  ``None`` is a legacy-view fallback until recovery passes
+        # the persisted flag; collecting preferences is harmless for games
+        # whose role-rating mode is disabled because the repository ignores
+        # them.
+        if self.role_rating_enabled is not False:
+            if not self._known_guild_matches(interaction):
+                try:
+                    await interaction.response.send_message(
+                        "이 내전은 현재 서버에서 사용할 수 없습니다.", ephemeral=True
+                    )
+                except TypeError:
+                    await interaction.response.send_message(
+                        "이 내전은 현재 서버에서 사용할 수 없습니다.", ephemeral=True
+                    )
+                return
+            try:
                 await interaction.response.send_modal(
                     JoinPreferencesModal(self, getattr(interaction, "message", None))
                 )
-                return
-        except MatchError as exc:
-            await interaction.response.send_message(_error_text(exc), ephemeral=True)
-            return
-        except Exception:
-            logger.exception("참가 지망 입력창 열기 실패", extra={"match_id": self.match_id})
-            await interaction.response.send_message(
-                "참가 처리 중 오류가 발생했습니다.", ephemeral=True
-            )
+            except Exception:
+                logger.exception("참가 지망 입력창 열기 실패", extra={"match_id": self.match_id})
+                if not getattr(interaction.response, "is_done", lambda: False)():
+                    await interaction.response.send_message(
+                        "참가 처리 중 오류가 발생했습니다.", ephemeral=True
+                    )
             return
         await self._run(
             interaction,
@@ -335,6 +440,10 @@ class JoinPreferencesModal(discord.ui.Modal, title="내전 참가 라인 입력"
         await interaction.response.defer(ephemeral=True)
         view = self.match_view
         try:
+            # Modal submissions are the first place where we can afford a DB
+            # read.  Validate the persisted guild before joining so a modal
+            # opened from a stale/foreign server can never mutate the match.
+            await view._match_for_interaction(interaction)
             result = await view.service.join_match(
                 view.match_id,
                 int(interaction.user.id),
@@ -342,8 +451,23 @@ class JoinPreferencesModal(discord.ui.Modal, title="내전 참가 라인 입력"
                 preferred_role_2=str(self.second),
                 preferred_role_3=str(self.third) or None,
             )
+            text = "대기열에 등록했습니다." if _get(result, "waitlisted", False) else "내전에 참가했습니다."
+        except MatchError as exc:
+            text = _error_text(exc)
+            await view._followup(interaction, text)
+            return
+        except Exception:
+            logger.exception("지망 라인 참가 처리 실패", extra={"match_id": view.match_id})
+            await view._followup(interaction, "참가 처리 중 오류가 발생했습니다.")
+            return
+
+        # The DB mutation has succeeded.  Refreshing the source panel is a
+        # best-effort Discord side effect; an API failure must not turn a
+        # successful join into an error response.
+        try:
             latest = await view.service.get_match(view.match_id)
             if latest is not None and self.source_message is not None:
+                await view._match_for_interaction_from_loaded(interaction, latest)
                 await _safe_edit(
                     self.source_message,
                     embed=render_match(latest),
@@ -351,16 +475,16 @@ class JoinPreferencesModal(discord.ui.Modal, title="내전 참가 라인 입력"
                         view.service,
                         view.match_id,
                         status=str(_get(latest, "status", "")),
+                        guild_id=_get(latest, "guild_id", view.guild_id),
+                        role_rating_enabled=_get(
+                            latest, "role_rating_enabled", view.role_rating_enabled
+                        ),
                         team_a_voice_channel_id=view.team_a_voice_channel_id,
                         team_b_voice_channel_id=view.team_b_voice_channel_id,
                     ),
                 )
-            text = "대기열에 등록했습니다." if _get(result, "waitlisted", False) else "내전에 참가했습니다."
-        except MatchError as exc:
-            text = _error_text(exc)
         except Exception:
-            logger.exception("지망 라인 참가 처리 실패", extra={"match_id": view.match_id})
-            text = "참가 처리 중 오류가 발생했습니다."
+            logger.exception("참가 후 내전 메시지 갱신 실패", extra={"match_id": view.match_id})
         await view._followup(interaction, text)
 
 

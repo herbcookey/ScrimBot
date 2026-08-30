@@ -103,8 +103,11 @@ def resolve_voice_category_id(
         if category is None:
             return None, "설정한 내전 보이스 카테고리를 이 서버에서 찾을 수 없습니다."
         return int(category.id), None
-    if fixed_a_channel_id is not None and fixed_b_channel_id is not None:
-        return None, None
+    if fixed_a_channel_id is not None or fixed_b_channel_id is not None:
+        _, fixed_error = _fixed_voice_channels(
+            guild, fixed_a_channel_id, fixed_b_channel_id
+        )
+        return None, fixed_error
     category = getattr(text_channel, "category", None)
     if isinstance(category, discord.CategoryChannel) and _same_guild(category, guild):
         return int(category.id), None
@@ -139,6 +142,48 @@ def _can_move(guild: Any, channel: Any) -> bool:
     return bool(getattr(permissions, "connect", False) and getattr(permissions, "move_members", False))
 
 
+def _fixed_voice_channels(
+    guild: Any,
+    team_a_voice_channel_id: int | None,
+    team_b_voice_channel_id: int | None,
+) -> tuple[tuple[Any, Any] | None, str | None]:
+    """Resolve and validate configured fixed team voice channels.
+
+    Fixed channels are never created or deleted by the bot, but they still
+    need to be in the interaction's guild, be voice channels, and permit the
+    bot to connect and move members.  Returning a human-readable error keeps
+    configuration failures visible instead of silently reporting every member
+    as skipped.
+    """
+
+    if team_a_voice_channel_id is None and team_b_voice_channel_id is None:
+        return None, None
+    if team_a_voice_channel_id is None or team_b_voice_channel_id is None:
+        return None, "1팀과 2팀 고정 보이스 채널 ID를 모두 설정해야 합니다."
+    try:
+        channel_a_id = int(team_a_voice_channel_id)
+        channel_b_id = int(team_b_voice_channel_id)
+    except (TypeError, ValueError):
+        return None, "고정 보이스 채널 ID 설정이 올바르지 않습니다."
+    if channel_a_id == channel_b_id:
+        return None, "1팀과 2팀 고정 보이스 채널은 서로 달라야 합니다."
+    if guild is None or not callable(getattr(guild, "get_channel", None)):
+        return None, "설정한 고정 보이스 채널을 이 서버에서 찾을 수 없습니다."
+    channel_a = guild.get_channel(channel_a_id)
+    channel_b = guild.get_channel(channel_b_id)
+    if channel_a is None:
+        return None, "설정한 1팀 고정 보이스 채널을 이 서버에서 찾을 수 없습니다."
+    if channel_b is None:
+        return None, "설정한 2팀 고정 보이스 채널을 이 서버에서 찾을 수 없습니다."
+    if not isinstance(channel_a, discord.VoiceChannel) or not _same_guild(channel_a, guild):
+        return None, "설정한 1팀 고정 보이스 채널이 이 서버의 보이스 채널이 아닙니다."
+    if not isinstance(channel_b, discord.VoiceChannel) or not _same_guild(channel_b, guild):
+        return None, "설정한 2팀 고정 보이스 채널이 이 서버의 보이스 채널이 아닙니다."
+    if not _can_move(guild, channel_a) or not _can_move(guild, channel_b):
+        return None, "고정 보이스 채널에 Connect 및 Move Members 권한이 필요합니다."
+    return (channel_a, channel_b), None
+
+
 async def move_match_participants(
     guild: Any,
     match: Any,
@@ -147,13 +192,16 @@ async def move_match_participants(
 ) -> VoiceMoveSummary:
     if str(_value(match, "status", "PLAYING")) != "PLAYING":
         return VoiceMoveSummary(error="PLAYING 상태에서만 참가자를 이동합니다.")
-    if team_a_voice_channel_id is None or team_b_voice_channel_id is None:
+    if team_a_voice_channel_id is None and team_b_voice_channel_id is None:
         return VoiceMoveSummary()
-    channel_a = _voice_channel(guild, team_a_voice_channel_id)
-    channel_b = _voice_channel(guild, team_b_voice_channel_id)
+    channels, config_error = _fixed_voice_channels(
+        guild, team_a_voice_channel_id, team_b_voice_channel_id
+    )
     participants = tuple(_value(match, "participants", ()) or ())
-    if channel_a is None or channel_b is None:
-        return VoiceMoveSummary(skipped=len(participants))
+    if config_error:
+        return VoiceMoveSummary(error=config_error)
+    assert channels is not None
+    channel_a, channel_b = channels
     if not (_can_move(guild, channel_a) and _can_move(guild, channel_b)):
         return VoiceMoveSummary(
             failed=len(participants), error="보이스 이동에 필요한 Connect 또는 Move Members 권한이 없습니다."
@@ -183,10 +231,68 @@ async def move_match_participants(
     )
 
 
-def _named_channels(category: Any, name: str) -> list[Any]:
-    return [
+_MISSING = object()
+
+
+def _bot_ownership_status(channel: Any, guild: Any) -> bool | None:
+    """Return whether a channel carries durable bot-ownership evidence.
+
+    Dynamic channels are created with an explicit overwrite for the bot that
+    grants ``manage_channels``.  That overwrite survives restarts and is a
+    reliable discriminator from a user's similarly named channel.  A few
+    test/legacy channel doubles expose an explicit marker instead; channel
+    objects with no ownership API return ``None`` for a narrowly scoped
+    backwards-compatible adoption path.
+    """
+
+    for marker_name in (
+        "bot_owned",
+        "is_bot_owned",
+        "created_by_bot",
+        "_inhouse_bot_owned",
+    ):
+        marker = getattr(channel, marker_name, _MISSING)
+        if marker is not _MISSING:
+            return bool(marker)
+
+    me = _bot_member(guild)
+    overwrites_for = getattr(channel, "overwrites_for", None)
+    if me is not None and callable(overwrites_for):
+        try:
+            overwrite = overwrites_for(me)
+        except Exception:
+            logger.exception("보이스 채널 봇 권한 확인 실패", extra={"channel_id": getattr(channel, "id", None)})
+            return False
+        return bool(getattr(overwrite, "manage_channels", False))
+
+    # Some lightweight channel doubles expose a raw overwrite mapping rather
+    # than ``overwrites_for``.  Inspect it when present.
+    raw_overwrites = getattr(channel, "overwrites", _MISSING)
+    if raw_overwrites is not _MISSING:
+        if me is None:
+            return False
+        bot_id = getattr(me, "id", None)
+        for target, overwrite in getattr(raw_overwrites, "items", lambda: ())():
+            if target is me or (bot_id is not None and int(getattr(target, "id", -1)) == int(bot_id)):
+                return bool(getattr(overwrite, "manage_channels", False))
+        return False
+
+    # Legacy fake objects in older callers do not expose Discord overwrite
+    # APIs.  Keep them operational while ensuring real Discord channels (which
+    # always expose ``overwrites_for``) require the durable marker above.
+    return None
+
+
+def _named_channels(category: Any, name: str, guild: Any | None = None) -> list[Any]:
+    channels = [
         channel for channel in getattr(category, "voice_channels", ()) or ()
         if isinstance(channel, discord.VoiceChannel) and str(getattr(channel, "name", "")) == name
+    ]
+    if guild is None:
+        return channels
+    return [
+        channel for channel in channels
+        if _bot_ownership_status(channel, guild) is not False
     ]
 
 
@@ -236,8 +342,7 @@ async def ensure_match_voice_channels(
         return VoiceMoveSummary(error="PLAYING 상태에서만 보이스 채널을 준비합니다.")
     if (
         _value(match, "voice_category_id") is None
-        and fixed_a_channel_id is not None
-        and fixed_b_channel_id is not None
+        and (fixed_a_channel_id is not None or fixed_b_channel_id is not None)
     ):
         return await move_match_participants(guild, match, fixed_a_channel_id, fixed_b_channel_id)
 
@@ -275,7 +380,9 @@ async def ensure_match_voice_channels(
                 channel = _validate_saved_channel(guild, category, int(stored_id), team) if stored_id else None
                 if channel is None:
                     name = match_voice_channel_name(match_id, team)
-                    found = _named_channels(category, name)
+                    # A matching name alone is not sufficient for adoption;
+                    # require the persistent bot overwrite/ownership marker.
+                    found = _named_channels(category, name, guild)
                     if len(found) > 1:
                         raise VoiceSetupError(f"{name} 이름의 채널이 여러 개라 자동 복구하지 않았습니다.")
                     if found:

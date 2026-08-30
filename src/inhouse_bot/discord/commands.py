@@ -28,6 +28,13 @@ from .voice import (
 
 logger = logging.getLogger(__name__)
 
+# Discord renders a match title as the embed description and a result memo as
+# an embed field value. Keep these limits in the command layer as well as in
+# ``MatchService`` because direct callback calls (and non-Discord clients) do
+# not necessarily go through Discord's option validation.
+MATCH_TITLE_MAX_LENGTH = 4096
+RESULT_MEMO_MAX_LENGTH = 1024
+
 ROLE_CHOICES = [
     app_commands.Choice(name=name, value=value)
     for name, value in (("탑", "TOP"), ("정글", "JUNGLE"), ("미드", "MID"), ("원딜", "ADC"), ("서폿", "SUPPORT"))
@@ -232,7 +239,7 @@ class MatchCommandGroup(app_commands.Group):
     async def create(
         self,
         interaction: discord.Interaction,
-        title: str,
+        title: app_commands.Range[str, 1, MATCH_TITLE_MAX_LENGTH],
         preferred_role_1: app_commands.Choice[str],
         preferred_role_2: app_commands.Choice[str],
         recruitment_minutes: app_commands.Range[int, 5, 1440] | None = None,
@@ -247,6 +254,9 @@ class MatchCommandGroup(app_commands.Group):
         if not title:
             await self._send(interaction, "제목을 입력해 주세요.")
             return
+        if len(title) > MATCH_TITLE_MAX_LENGTH:
+            await self._send(interaction, f"제목은 {MATCH_TITLE_MAX_LENGTH}자 이내로 입력해 주세요.")
+            return
         await self._defer(interaction)
         try:
             voice_category_id, voice_category_error = resolve_voice_category_id(
@@ -256,7 +266,15 @@ class MatchCommandGroup(app_commands.Group):
                 self.team_a_voice_channel_id,
                 self.team_b_voice_channel_id,
             )
-            if self.inhouse_voice_category_id is not None and voice_category_error:
+            # A configured voice category or fixed team channel is an
+            # explicit deployment setting.  Never persist a match when that
+            # setting is invalid; otherwise creation would report success
+            # while voice setup is guaranteed to fail later.
+            if voice_category_error and (
+                self.inhouse_voice_category_id is not None
+                or self.team_a_voice_channel_id is not None
+                or self.team_b_voice_channel_id is not None
+            ):
                 await self._send(interaction, voice_category_error)
                 return
             created = await self.service.create_match(
@@ -278,6 +296,8 @@ class MatchCommandGroup(app_commands.Group):
                 self.service,
                 match_id,
                 status=str(_get(latest or created, "status", "RECRUITING")),
+                guild_id=int(_get(latest or created, "guild_id", interaction.guild.id)),
+                role_rating_enabled=_get(latest or created, "role_rating_enabled"),
                 team_a_voice_channel_id=self.team_a_voice_channel_id,
                 team_b_voice_channel_id=self.team_b_voice_channel_id,
             )
@@ -289,24 +309,22 @@ class MatchCommandGroup(app_commands.Group):
                     embed=render_match(latest or created),
                     view=view,
                 )
-                await self.service.update_message_id(match_id, int(message.id))
+                attach = getattr(self.service, "attach_message_id", None)
+                if callable(attach):
+                    await attach(match_id, int(message.id))
+                else:
+                    await self.service.update_message_id(match_id, int(message.id))
             except Exception:
                 logger.exception("내전 메시지 전송 실패", extra={"match_id": match_id})
-                try:
-                    await self.service.cancel_missing_message(match_id)
-                except Exception:
-                    logger.exception("전송 못 한 내전 취소 실패", extra={"match_id": match_id})
-                if message is not None:
-                    try:
-                        cancelled = await self.service.get_match(match_id)
-                        await _safe_edit(
-                            message,
-                            embed=render_match(cancelled or created),
-                            view=MatchView(self.service, match_id, status="CANCELLED", disabled=True),
-                        )
-                    except Exception:
-                        logger.exception("전송된 내전 메시지 취소 표시 실패", extra={"match_id": match_id})
-                await self._send(interaction, "내전 메시지 처리에 실패해 내전을 취소했습니다.")
+                # Discord may have accepted the message while the DB write
+                # failed (or may have rejected the send transiently).  Keep
+                # the active row panel-less so startup/poll recovery can
+                # adopt/repost it; cancelling here loses the match and makes
+                # retries non-idempotent.
+                await self._send(
+                    interaction,
+                    "내전은 생성됐지만 패널 게시가 지연되고 있습니다. 잠시 후 자동으로 복구합니다.",
+                )
                 return
             await self._send(
                 interaction,
@@ -365,10 +383,13 @@ class MatchCommandGroup(app_commands.Group):
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
+        # The permission check performs a remote DB read.  Acknowledge the
+        # interaction before waiting on it so a slow database cannot expire
+        # Discord's initial response window.
+        await self._defer(interaction)
         if not await self._is_bot_admin(interaction):
             await self._send(interaction, "봇 관리자 권한이 필요합니다.")
             return
-        await self._defer(interaction)
         try:
             admins = tuple(await self.service.list_bot_admins(int(interaction.guild.id)) or ())
             user_ids = []
@@ -500,10 +521,11 @@ class MatchCommandGroup(app_commands.Group):
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
+        # ``_is_bot_admin`` can await PostgreSQL; defer first.
+        await self._defer(interaction)
         if not await self._is_bot_admin(interaction):
             await self._send(interaction, "봇 관리자 권한이 필요합니다.")
             return
-        await self._defer(interaction)
         try:
             season = await self.service.start_season(
                 int(interaction.guild.id),
@@ -529,10 +551,11 @@ class MatchCommandGroup(app_commands.Group):
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
+        # ``_is_bot_admin`` can await PostgreSQL; defer first.
+        await self._defer(interaction)
         if not await self._is_bot_admin(interaction):
             await self._send(interaction, "봇 관리자 권한이 필요합니다.")
             return
-        await self._defer(interaction)
         try:
             season = await self.service.end_season(
                 int(interaction.guild.id),
@@ -685,6 +708,8 @@ class MatchCommandGroup(app_commands.Group):
         if interaction.guild is None:
             await self._send(interaction, "서버에서만 사용할 수 있습니다.")
             return
+        # Keep all remote permission work after the acknowledgement.
+        await self._defer(interaction)
         if not await self._is_bot_admin(interaction):
             await self._send(interaction, "봇 관리자 권한이 필요합니다.")
             return
@@ -697,7 +722,6 @@ class MatchCommandGroup(app_commands.Group):
             except RoleAssignmentError as exc:
                 await self._send(interaction, str(exc))
                 return
-        await self._defer(interaction)
         try:
             value = await self.service.set_role_rating(
                 int(interaction.guild.id), int(user.id), _choice_value(role),
@@ -766,10 +790,16 @@ class MatchCommandGroup(app_commands.Group):
         self,
         interaction: discord.Interaction,
         winner_team: app_commands.Choice[str],
-        memo: str | None = None,
+        memo: app_commands.Range[str, 0, RESULT_MEMO_MAX_LENGTH] | None = None,
     ) -> None:
         if interaction.guild is None or interaction.channel is None:
             await self._send(interaction, "서버 채널에서만 사용할 수 있습니다.")
+            return
+        if memo is not None and len(memo) > RESULT_MEMO_MAX_LENGTH:
+            await self._send(
+                interaction,
+                f"결과 메모는 {RESULT_MEMO_MAX_LENGTH}자 이내로 입력해 주세요.",
+            )
             return
         await self._defer(interaction)
         try:
@@ -862,6 +892,8 @@ class MatchCommandGroup(app_commands.Group):
                     self.service,
                     match_id,
                     status=str(_get(latest, "status", "")),
+                    guild_id=_get(latest, "guild_id"),
+                    role_rating_enabled=_get(latest, "role_rating_enabled"),
                     disabled=terminal,
                     team_a_voice_channel_id=self.team_a_voice_channel_id,
                     team_b_voice_channel_id=self.team_b_voice_channel_id,

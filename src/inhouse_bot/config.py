@@ -13,6 +13,7 @@ class Settings:
     bot_owner_id: int
     database_url: str
     ready_timeout_seconds: int = 120
+    draft_timeout_seconds: int = 120
     default_recruitment_minutes: int = 30
     reminder_before_seconds: int = 300
     voice_cleanup_delay_seconds: int = 600
@@ -41,6 +42,7 @@ def load_settings() -> Settings:
     bot_owner_id = _positive_int("BOT_OWNER_ID", 0)
 
     ready_timeout_seconds = _positive_int("READY_TIMEOUT_SECONDS", 120)
+    draft_timeout_seconds = _positive_int("DRAFT_TIMEOUT_SECONDS", 120)
     default_recruitment_minutes = _bounded_int(
         "DEFAULT_RECRUITMENT_MINUTES", 30, minimum=5, maximum=1440
     )
@@ -60,6 +62,7 @@ def load_settings() -> Settings:
         bot_owner_id=bot_owner_id,
         database_url=os.environ["DATABASE_URL"],
         ready_timeout_seconds=ready_timeout_seconds,
+        draft_timeout_seconds=draft_timeout_seconds,
         default_recruitment_minutes=default_recruitment_minutes,
         reminder_before_seconds=reminder_before_seconds,
         voice_cleanup_delay_seconds=voice_cleanup_delay_seconds,

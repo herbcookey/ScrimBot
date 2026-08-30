@@ -110,6 +110,7 @@ def test_renderer_drafting_and_assigned_roles():
         status="DRAFTING", title="지명 테스트", capacity=10, creator_id=1,
         role_rating_enabled=True, captain_a_id=1, captain_b_id=2,
         draft_pick_index=0,
+        draft_deadline_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
         participants=(
             _role_participant(1, team="A"),
             _role_participant(2, team="B"),
@@ -121,6 +122,7 @@ def test_renderer_drafting_and_assigned_roles():
     assert fields["상태"] == "주장 지명"
     assert "A팀 <@1>" == fields["현재 지명"]
     assert "탑/미드" in fields["미지명"] and "1500점" in fields["미지명"]
+    assert "<t:" in fields["지명 마감"]
 
     playing = SimpleNamespace(
         status="PLAYING", title="라인 테스트", capacity=2, creator_id=1,
@@ -434,6 +436,230 @@ async def test_admin_mmr_command_uses_compact_tier_and_prioritizes_score():
         123, 88, "ADC", game_key="lol", tier="잘못된티어", rating=1900,
         manager_override=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_name", ("admin_list", "season_start", "season_end", "set_mmr"))
+async def test_admin_commands_defer_before_remote_permission_check(command_name):
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    events = []
+
+    async def is_admin(*_args):
+        events.append("permission")
+        return False
+
+    service = SimpleNamespace(is_bot_admin=is_admin)
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    interaction.response.is_done = lambda: False
+
+    async def defer(*_args, **_kwargs):
+        events.append("defer")
+
+    interaction.response.defer.side_effect = defer
+    if command_name == "admin_list":
+        await MatchCommandGroup.admin_list.callback(group, interaction)
+    elif command_name == "season_start":
+        await MatchCommandGroup.season_start.callback(group, interaction, "시즌", None)
+    elif command_name == "season_end":
+        await MatchCommandGroup.season_end.callback(group, interaction, None)
+    else:
+        target = SimpleNamespace(id=88)
+        role = discord.app_commands.Choice(name="원딜", value="ADC")
+        await MatchCommandGroup.set_mmr.callback(group, interaction, target, role, "플래티넘2", None, "lol")
+
+    assert events[:2] == ["defer", "permission"]
+
+
+@pytest.mark.asyncio
+async def test_role_join_modal_does_not_wait_for_match_when_role_state_is_known():
+    from inhouse_bot.discord.views import MatchView
+
+    service = SimpleNamespace(get_match=AsyncMock(side_effect=AssertionError("modal opened before DB read")))
+    view = MatchView(service, 42, status="RECRUITING", guild_id=123, role_rating_enabled=True)
+    response = SimpleNamespace(send_modal=AsyncMock(), send_message=AsyncMock())
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=123),
+        user=SimpleNamespace(id=7),
+        response=response,
+        message=object(),
+    )
+
+    await view._join(interaction)
+
+    response.send_modal.assert_awaited_once()
+    service.get_match.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_role_join_success_survives_source_message_edit_failure():
+    from inhouse_bot.discord.views import JoinPreferencesModal, MatchView
+
+    latest = SimpleNamespace(
+        id=42,
+        guild_id=123,
+        status="RECRUITING",
+        title="참가 테스트",
+        capacity=10,
+        creator_id=1,
+        participants=(),
+        waitlist=(),
+        recruitment_deadline_at=None,
+    )
+    source_message = SimpleNamespace(edit=AsyncMock(side_effect=RuntimeError("Discord down")))
+    service = SimpleNamespace(
+        get_match=AsyncMock(return_value=latest),
+        join_match=AsyncMock(return_value=SimpleNamespace(waitlisted=False)),
+    )
+    view = MatchView(service, 42, guild_id=123, role_rating_enabled=True)
+    modal = JoinPreferencesModal(view, source_message)
+    response = SimpleNamespace(defer=AsyncMock())
+    followup = SimpleNamespace(send=AsyncMock())
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=123),
+        user=SimpleNamespace(id=7),
+        response=response,
+        followup=followup,
+    )
+
+    await modal.on_submit(interaction)
+
+    service.join_match.assert_awaited_once()
+    source_message.edit.assert_awaited_once()
+    assert "참가했습니다" in followup.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_foreign_guild_button_is_rejected_before_mutation():
+    from inhouse_bot.discord.views import MatchView
+
+    service = SimpleNamespace(
+        get_match=AsyncMock(return_value=SimpleNamespace(id=42, guild_id=123)),
+        leave_match=AsyncMock(),
+    )
+    view = MatchView(service, 42, status="RECRUITING", guild_id=123, role_rating_enabled=False)
+    response = SimpleNamespace(is_done=lambda: False, defer=AsyncMock())
+    followup = SimpleNamespace(send=AsyncMock())
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=999),
+        user=SimpleNamespace(id=7),
+        response=response,
+        followup=followup,
+        message=None,
+    )
+
+    await view._leave(interaction)
+
+    service.leave_match.assert_not_awaited()
+    assert "현재 서버" in followup.send.await_args.args[0]
+
+
+def test_embed_limits_are_exposed_in_command_metadata():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    title = MatchCommandGroup.create._params["title"]
+    memo = MatchCommandGroup.result._params["memo"]
+    assert title.min_value == 1 and title.max_value == 4096
+    assert memo.min_value == 0 and memo.max_value == 1024
+
+
+@pytest.mark.asyncio
+async def test_overlong_title_and_result_memo_are_rejected_before_service_calls():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(
+        create_match=AsyncMock(),
+        get_active_match=AsyncMock(),
+        finish_match=AsyncMock(),
+    )
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    await MatchCommandGroup.create.callback(
+        group,
+        interaction,
+        "x" * 4097,
+        discord.app_commands.Choice(name="탑", value="TOP"),
+        discord.app_commands.Choice(name="미드", value="MID"),
+    )
+    service.create_match.assert_not_awaited()
+
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    await MatchCommandGroup.result.callback(
+        group,
+        interaction,
+        discord.app_commands.Choice(name="A팀", value="A"),
+        "x" * 1025,
+    )
+    service.get_active_match.assert_not_awaited()
+    service.finish_match.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_embed_text_limits_guard_repository_mutations():
+    from inhouse_bot.services.matches import MatchService
+
+    repository = SimpleNamespace(
+        create_match=AsyncMock(return_value=object()),
+        finish_match=AsyncMock(return_value=object()),
+    )
+    service = object.__new__(MatchService)
+    service.repository = repository
+    service.default_recruitment_minutes = 30
+    service.voice_cleanup_delay_seconds = 600
+
+    await service.create_match(1, 2, 3, "x" * 4096)
+    repository.create_match.assert_awaited_once()
+    with pytest.raises(ValueError):
+        await service.create_match(1, 2, 3, "x" * 4097)
+    with pytest.raises(ValueError):
+        await service.create_match(1, 2, 3, "")
+    assert repository.create_match.await_count == 1
+
+    await service.finish_match(42, 7, "A", "")
+    await service.finish_match(42, 7, "A", "x" * 1024)
+    assert repository.finish_match.await_count == 2
+    with pytest.raises(ValueError):
+        await service.finish_match(42, 7, "A", "x" * 1025)
+    assert repository.finish_match.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "voice_error",
+    (
+        "설정한 1팀 고정 보이스 채널을 이 서버에서 찾을 수 없습니다.",
+        "설정한 1팀 고정 보이스 채널이 이 서버의 보이스 채널이 아닙니다.",
+        "설정한 2팀 고정 보이스 채널이 이 서버의 보이스 채널이 아닙니다.",
+        "고정 보이스 채널에 Connect 및 Move Members 권한이 필요합니다.",
+    ),
+)
+async def test_create_rejects_invalid_configured_fixed_voice_before_persist(
+    monkeypatch, voice_error
+):
+    import inhouse_bot.discord.commands as commands_module
+
+    monkeypatch.setattr(
+        commands_module,
+        "resolve_voice_category_id",
+        lambda *_args: (None, voice_error),
+    )
+    service = SimpleNamespace(create_match=AsyncMock())
+    group = commands_module.MatchCommandGroup(
+        service, team_a_voice_channel_id=50, team_b_voice_channel_id=51
+    )
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+
+    await commands_module.MatchCommandGroup.create.callback(
+        group,
+        interaction,
+        "고정 보이스 테스트",
+        discord.app_commands.Choice(name="탑", value="TOP"),
+        discord.app_commands.Choice(name="미드", value="MID"),
+    )
+
+    service.create_match.assert_not_awaited()
+    assert voice_error in interaction.followup.send.await_args.args[0]
 
 
 def test_load_settings_rejects_duplicate_voice_channels(monkeypatch):

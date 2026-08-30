@@ -358,6 +358,29 @@ async def test_recruitment_reminder_once_and_short_recruitment_skips_it(service_
 
 
 @pytest.mark.asyncio
+async def test_recruitment_reminder_claim_ack_and_stale_retry_are_token_safe(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    match = await service.create_match(
+        guild_id, channel_id, 1, "재시도 모집", recruitment_minutes=10, now=T0
+    )
+    first_events = await service.process_due_matches(now=T0 + timedelta(minutes=6))
+    assert len(first_events) == 1 and first_events[0].kind == "recruitment_reminder"
+    first_token = first_events[0].delivery_token
+    assert first_token
+    assert not await service.acknowledge_recruitment_reminder(match.id, "00000000-0000-0000-0000-000000000000", now=T0)
+
+    retry_at = T0 + timedelta(minutes=6, seconds=30)
+    assert await service.retry_recruitment_reminder(match.id, first_token, retry_at)
+    second_events = await service.process_due_matches(now=retry_at + timedelta(seconds=1))
+    assert len(second_events) == 1 and second_events[0].kind == "recruitment_reminder"
+    second_token = second_events[0].delivery_token
+    assert second_token and second_token != first_token
+    assert not await service.acknowledge_recruitment_reminder(match.id, first_token, now=retry_at)
+    assert await service.acknowledge_recruitment_reminder(match.id, second_token, now=retry_at)
+    assert await service.process_due_matches(now=retry_at + timedelta(minutes=1)) == []
+
+
+@pytest.mark.asyncio
 async def test_recruitment_expiry_underfull_cancels_and_full_enters_ready(service_and_scope):
     service, guild_id, channel_id = service_and_scope
     underfull = await service.create_match(

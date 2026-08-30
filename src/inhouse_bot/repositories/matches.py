@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import random
 from typing import Any, Mapping
+from uuid import uuid4
 
 from inhouse_bot.role_assignment import (
     DRAFT_TEAMS,
@@ -38,6 +39,10 @@ PARTICIPANT = MEMBER
 WAITLIST = "WAITLIST"
 DEFAULT_READY_TIMEOUT_SECONDS = 120
 DEFAULT_RECRUITMENT_MINUTES = 30
+DEFAULT_DRAFT_TIMEOUT_SECONDS = 120
+DEFAULT_REMINDER_RETRY_SECONDS = 60
+MIN_RATING = 0
+MAX_RATING = 10000
 
 
 class MatchError(RuntimeError):
@@ -308,7 +313,12 @@ class Match:
     voice_cleanup_at: datetime | None = None
     recruitment_deadline_at: datetime | None = None
     recruitment_reminded_at: datetime | None = None
+    recruitment_reminder_sent_at: datetime | None = None
+    recruitment_reminder_retry_at: datetime | None = None
+    recruitment_reminder_attempts: int = 0
+    recruitment_reminder_token: str | None = None
     ready_deadline_at: datetime | None = None
+    draft_deadline_at: datetime | None = None
     cancel_reason: str | None = None
     participants: tuple[Participant, ...] = field(default_factory=tuple)
     waitlist: tuple[Participant, ...] = field(default_factory=tuple)
@@ -387,6 +397,9 @@ class MatchEvent:
     kind: str
     removed_user_ids: tuple[int, ...] = field(default_factory=tuple)
     promoted_user_ids: tuple[int, ...] = field(default_factory=tuple)
+    # A reminder claim token is carried out of the DB transaction and is
+    # checked again when Discord acknowledges or retries the send.
+    delivery_token: str | None = None
 
     @property
     def match_id(self) -> int:
@@ -426,6 +439,12 @@ def _validate_recruitment_minutes(minutes: int) -> int:
     if not 5 <= int(minutes) <= 1440:
         raise InvalidRecruitmentMinutesError()
     return int(minutes)
+
+
+def _bounded_rating(value: int | float) -> int:
+    """Return an MMR value constrained to the range stored in the database."""
+
+    return max(MIN_RATING, min(MAX_RATING, int(value)))
 
 
 def calculate_rating_delta(
@@ -584,7 +603,15 @@ class MatchRepository:
             "ended_at": _row_value(row, "ended_at"),
             "recruitment_deadline_at": _row_value(row, "recruitment_deadline_at"),
             "recruitment_reminded_at": _row_value(row, "recruitment_reminded_at"),
+            "recruitment_reminder_sent_at": _row_value(row, "recruitment_reminder_sent_at"),
+            "recruitment_reminder_retry_at": _row_value(row, "recruitment_reminder_retry_at"),
+            "recruitment_reminder_attempts": int(_row_value(row, "recruitment_reminder_attempts", 0)),
+            "recruitment_reminder_token": (
+                str(_row_value(row, "recruitment_reminder_token"))
+                if _row_value(row, "recruitment_reminder_token") is not None else None
+            ),
             "ready_deadline_at": _row_value(row, "ready_deadline_at"),
+            "draft_deadline_at": _row_value(row, "draft_deadline_at"),
             "cancel_reason": _row_value(row, "cancel_reason"),
         }
 
@@ -601,6 +628,10 @@ class MatchRepository:
                    m.voice_cleanup_at, m.creator_id, m.title, m.capacity, m.status,
                    m.created_at, m.started_at, m.ended_at,
                    m.recruitment_deadline_at, m.recruitment_reminded_at,
+                   m.recruitment_reminder_sent_at, m.recruitment_reminder_retry_at,
+                   m.recruitment_reminder_attempts,
+                   m.recruitment_reminder_token,
+                   m.draft_deadline_at,
                    m.ready_deadline_at, m.cancel_reason
             FROM matches AS m
             JOIN games AS g ON g.id = m.game_id
@@ -668,6 +699,10 @@ class MatchRepository:
                    team_a_voice_closed_at, team_b_voice_closed_at, voice_cleanup_at,
                    created_at, started_at, ended_at,
                    recruitment_deadline_at, recruitment_reminded_at,
+                   recruitment_reminder_sent_at, recruitment_reminder_retry_at,
+                   recruitment_reminder_attempts,
+                   recruitment_reminder_token,
+                   draft_deadline_at,
                    ready_deadline_at, cancel_reason
             FROM matches WHERE id = $1 FOR UPDATE
             """,
@@ -681,6 +716,48 @@ class MatchRepository:
     def _require_state(row: Any, *states: str) -> None:
         if _row_value(row, "status") not in states:
             raise InvalidMatchStateError()
+
+    @staticmethod
+    def _require_deadline_open(row: Any, current: datetime) -> None:
+        """Reject mutations at or after the active phase deadline.
+
+        The caller must invoke this immediately after ``_locked_match``.  Since
+        the match row is locked by that query, a concurrent due-job transition
+        either happens first (and changes the state seen here) or this check
+        wins and leaves the due job to process the expired match.
+        """
+
+        status = _row_value(row, "status")
+        if status == RECRUITING:
+            deadline = _row_value(row, "recruitment_deadline_at")
+            phase = "모집"
+        elif status == READY_CHECK:
+            deadline = _row_value(row, "ready_deadline_at")
+            phase = "준비 확인"
+        elif status == DRAFTING:
+            deadline = _row_value(row, "draft_deadline_at")
+            phase = "지명"
+        else:
+            return
+        if deadline is not None and current >= _now(deadline):
+            raise InvalidMatchStateError(f"{phase} 시간이 만료되었습니다.")
+
+    @staticmethod
+    def _validate_role_rating_match(
+        role_rating_enabled: bool, capacity: int, team_size: int
+    ) -> None:
+        """Validate the only supported roster for line-MMR matches.
+
+        Role assignment currently has one slot for each of the five supported
+        roles on each team.  Keep this check in one place and run it while a
+        game/match is still being created (and again before starting a match
+        loaded from an older or manually-edited row).
+        """
+
+        if bool(role_rating_enabled) and (
+            int(capacity) != 10 or int(team_size) != 5
+        ):
+            raise InvalidCapacityError("라인 배정 게임은 현재 5대5만 지원합니다.")
 
     @staticmethod
     def _require_manager(row: Any, actor_id: int, manager_override: bool) -> None:
@@ -784,7 +861,13 @@ class MatchRepository:
                 """
                 UPDATE matches
                 SET status = 'READY_CHECK', ready_deadline_at = $2,
-                    recruitment_deadline_at = NULL
+                    recruitment_deadline_at = NULL,
+                    recruitment_reminded_at = NULL,
+                    recruitment_reminder_sent_at = NULL,
+                    recruitment_reminder_retry_at = NULL,
+                    recruitment_reminder_attempts = 0,
+                    recruitment_reminder_token = NULL,
+                    draft_deadline_at = NULL
                 WHERE id = $1
                 """,
                 match_id,
@@ -795,7 +878,12 @@ class MatchRepository:
                 """
                 UPDATE matches
                 SET status = 'RECRUITING', ready_deadline_at = NULL,
-                    recruitment_deadline_at = $2, recruitment_reminded_at = NULL
+                    recruitment_deadline_at = $2, recruitment_reminded_at = NULL,
+                    recruitment_reminder_sent_at = NULL,
+                    recruitment_reminder_retry_at = NULL,
+                    recruitment_reminder_attempts = 0,
+                    recruitment_reminder_token = NULL,
+                    draft_deadline_at = NULL
                 WHERE id = $1
                 """,
                 match_id,
@@ -902,12 +990,18 @@ class MatchRepository:
                    WHERE match_id = $1 AND user_id = $2
                      AND membership = 'PARTICIPANT'""",
                 match_id, assignment.user_id, assignment.team,
-                assignment.role, assignment.rating,
+                assignment.role, _bounded_rating(assignment.rating),
             )
         await conn.execute(
             """UPDATE matches
                SET status = 'PLAYING', started_at = $2, ready_deadline_at = NULL,
-                   recruitment_deadline_at = NULL
+                   recruitment_deadline_at = NULL,
+                   recruitment_reminded_at = NULL,
+                   recruitment_reminder_sent_at = NULL,
+                   recruitment_reminder_retry_at = NULL,
+                   recruitment_reminder_attempts = 0,
+                   recruitment_reminder_token = NULL,
+                   draft_deadline_at = NULL
                WHERE id = $1""",
             match_id, current,
         )
@@ -938,7 +1032,7 @@ class MatchRepository:
                 value = initial_role_rating(parsed_tier, division)
         except (RoleAssignmentError, TypeError, ValueError) as exc:
             raise InvalidRolePreferencesError(str(exc)) from exc
-        if not 0 <= value <= 10000:
+        if not MIN_RATING <= value <= MAX_RATING:
             raise InvalidRolePreferencesError("MMR은 0점에서 10000점 사이여야 합니다.")
         current = _now(now)
         async with self.pool.acquire() as conn:
@@ -988,6 +1082,8 @@ class MatchRepository:
             value = initial_role_rating(canonical_tier, division)
         except (RoleAssignmentError, TypeError, ValueError) as exc:
             raise InvalidRolePreferencesError(str(exc)) from exc
+        if not MIN_RATING <= value <= MAX_RATING:
+            raise InvalidRolePreferencesError("MMR은 0점에서 10000점 사이여야 합니다.")
         current = _now(now)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -1150,6 +1246,11 @@ class MatchRepository:
                             "Draft 방식은 라인 MMR을 쓰는 게임에서만 사용할 수 있습니다."
                         )
                     game_capacity = int(_row_value(game, "capacity"))
+                    self._validate_role_rating_match(
+                        bool(_row_value(game, "role_rating_enabled")),
+                        game_capacity,
+                        int(_row_value(game, "team_size")),
+                    )
                     if capacity is not None and int(capacity) != game_capacity:
                         raise InvalidCapacityError(
                             f"{_row_value(game, 'name')} 내전 정원은 {game_capacity}명입니다."
@@ -1235,6 +1336,7 @@ class MatchRepository:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_state(row, RECRUITING, READY_CHECK)
+                self._require_deadline_open(row, current)
                 await self._require_membership_available(
                     conn, int(_row_value(row, "guild_id")), user_id, match_id
                 )
@@ -1296,8 +1398,10 @@ class MatchRepository:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_state(row, RECRUITING, READY_CHECK)
+                self._require_deadline_open(row, current)
                 participant = await conn.fetchrow(
-                    "SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2",
+                    """SELECT membership FROM match_participants
+                       WHERE match_id = $1 AND user_id = $2""",
                     match_id, user_id,
                 )
                 if participant is None:
@@ -1315,7 +1419,10 @@ class MatchRepository:
                        WHERE match_id = $1 AND user_id = $2""",
                     match_id, user_id, *preferences,
                 )
-                if _row_value(row, "status") == READY_CHECK:
+                if (
+                    _row_value(row, "status") == READY_CHECK
+                    and _row_value(participant, "membership", MEMBER) == MEMBER
+                ):
                     await self._reset_ready_roster(
                         conn, row, match_id, current,
                         ready_timeout_seconds, default_recruitment_minutes,
@@ -1338,6 +1445,7 @@ class MatchRepository:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_state(row, RECRUITING, READY_CHECK)
+                self._require_deadline_open(row, current)
                 member = await conn.fetchrow(
                     "SELECT membership FROM match_participants WHERE match_id = $1 AND user_id = $2",
                     match_id, user_id,
@@ -1384,6 +1492,7 @@ class MatchRepository:
                 row = await self._locked_match(conn, match_id)
                 self._require_manager(row, actor_id, manager_override)
                 self._require_state(row, RECRUITING)
+                self._require_deadline_open(row, current)
                 count = await self._participant_count(conn, match_id)
                 capacity = int(_row_value(row, "capacity"))
                 if count != capacity:
@@ -1404,7 +1513,13 @@ class MatchRepository:
                     """
                     UPDATE matches
                     SET status = 'READY_CHECK', ready_deadline_at = $2,
-                        recruitment_deadline_at = NULL
+                        recruitment_deadline_at = NULL,
+                        recruitment_reminded_at = NULL,
+                        recruitment_reminder_sent_at = NULL,
+                        recruitment_reminder_retry_at = NULL,
+                        recruitment_reminder_attempts = 0,
+                        recruitment_reminder_token = NULL,
+                        draft_deadline_at = NULL
                     WHERE id = $1
                     """,
                     match_id, current + timedelta(seconds=ready_timeout_seconds),
@@ -1432,12 +1547,15 @@ class MatchRepository:
         user_id: int,
         *,
         now: datetime | None = None,
+        draft_timeout_seconds: int = DEFAULT_DRAFT_TIMEOUT_SECONDS,
     ) -> Match:
+        draft_timeout_seconds = _validate_timeout(draft_timeout_seconds)
         current = _now(now)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_state(row, READY_CHECK)
+                self._require_deadline_open(row, current)
                 participant = await conn.fetchrow(
                     """
                     SELECT ready_at FROM match_participants
@@ -1470,11 +1588,14 @@ class MatchRepository:
                         int(_row_value(row, "game_id")),
                     )
                     team_size = int(_row_value(game, "team_size"))
+                    self._validate_role_rating_match(
+                        bool(_row_value(row, "role_rating_enabled")),
+                        int(_row_value(row, "capacity")),
+                        team_size,
+                    )
                     if int(_row_value(row, "capacity")) != team_size * 2:
                         raise InvalidCapacityError()
                     if bool(_row_value(row, "role_rating_enabled")):
-                        if int(_row_value(row, "capacity")) != 10 or team_size != 5:
-                            raise InvalidCapacityError("라인 배정 게임은 현재 5대5만 지원합니다.")
                         players = await self._role_players(conn, row, match_id)
                         try:
                             if _row_value(row, "assignment_mode") == "DRAFT":
@@ -1505,9 +1626,16 @@ class MatchRepository:
                                     """UPDATE matches SET status = 'DRAFTING',
                                            captain_a_id = $2, captain_b_id = $3,
                                            draft_pick_index = 0, ready_deadline_at = NULL,
-                                           recruitment_deadline_at = NULL
+                                           recruitment_deadline_at = NULL,
+                                           recruitment_reminded_at = NULL,
+                                           recruitment_reminder_sent_at = NULL,
+                                           recruitment_reminder_retry_at = NULL,
+                                           recruitment_reminder_attempts = 0,
+                                           recruitment_reminder_token = NULL,
+                                           draft_deadline_at = $4
                                        WHERE id = $1""",
                                     match_id, captain_a, captain_b,
+                                    current + timedelta(seconds=draft_timeout_seconds),
                                 )
                             else:
                                 assignments = balanced_assignment(players, match_id)
@@ -1549,11 +1677,19 @@ class MatchRepository:
                                        WHERE match_id = $1 AND user_id = $2
                                          AND membership = 'PARTICIPANT'""",
                                     match_id, member_id, team,
-                                    rating_by_user.get(member_id, default_rating),
+                                    _bounded_rating(
+                                        rating_by_user.get(member_id, default_rating)
+                                    ),
                                 )
                         await conn.execute(
                             """UPDATE matches SET status = 'PLAYING', started_at = $2,
-                                   ready_deadline_at = NULL, recruitment_deadline_at = NULL
+                                   ready_deadline_at = NULL, recruitment_deadline_at = NULL,
+                                   recruitment_reminded_at = NULL,
+                                   recruitment_reminder_sent_at = NULL,
+                                   recruitment_reminder_retry_at = NULL,
+                                   recruitment_reminder_attempts = 0,
+                                   recruitment_reminder_token = NULL,
+                                   draft_deadline_at = NULL
                                WHERE id = $1 AND status = 'READY_CHECK'""",
                             match_id, current,
                         )
@@ -1568,12 +1704,15 @@ class MatchRepository:
         target_user_id: int,
         *,
         now: datetime | None = None,
+        draft_timeout_seconds: int = DEFAULT_DRAFT_TIMEOUT_SECONDS,
     ) -> Match:
+        draft_timeout_seconds = _validate_timeout(draft_timeout_seconds)
         current = _now(now)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await self._locked_match(conn, match_id)
                 self._require_state(row, DRAFTING)
+                self._require_deadline_open(row, current)
                 index = int(_row_value(row, "draft_pick_index"))
                 if index >= len(DRAFT_TEAMS):
                     raise InvalidDraftPickError("지명이 이미 끝났습니다.")
@@ -1624,8 +1763,12 @@ class MatchRepository:
                     started = True
                 else:
                     await conn.execute(
-                        "UPDATE matches SET draft_pick_index = $2 WHERE id = $1",
+                        """UPDATE matches
+                           SET draft_pick_index = $2,
+                               draft_deadline_at = $3
+                           WHERE id = $1 AND status = 'DRAFTING'""",
                         match_id, index + 1,
+                        current + timedelta(seconds=draft_timeout_seconds),
                     )
                 return replace(await self._fetch_match(conn, match_id), started=started)
 
@@ -1648,6 +1791,7 @@ class MatchRepository:
                 row = await self._locked_match(conn, match_id)
                 self._require_manager(row, actor_id, manager_override)
                 self._require_state(row, RECRUITING, READY_CHECK)
+                self._require_deadline_open(row, current)
                 member = await conn.fetchrow(
                     "SELECT membership FROM match_participants WHERE match_id = $1 AND user_id = $2",
                     match_id, target_user_id,
@@ -1698,7 +1842,13 @@ class MatchRepository:
                     """
                     UPDATE matches
                     SET status = 'CANCELLED', ended_at = $2::timestamptz,
-                        ready_deadline_at = NULL, cancel_reason = $3,
+                        ready_deadline_at = NULL, recruitment_deadline_at = NULL,
+                        recruitment_reminded_at = NULL,
+                        recruitment_reminder_sent_at = NULL,
+                        recruitment_reminder_retry_at = NULL,
+                        recruitment_reminder_attempts = 0,
+                        recruitment_reminder_token = NULL,
+                        draft_deadline_at = NULL, cancel_reason = $3,
                         voice_cleanup_at = CASE
                             WHEN team_a_voice_channel_id IS NOT NULL
                               OR team_b_voice_channel_id IS NOT NULL
@@ -1797,7 +1947,9 @@ class MatchRepository:
                                 f"<@{participant_id}>님의 {ROLE_LABELS[role]} MMR이 없습니다."
                             )
                         participant_data[participant_id] = team, role
-                        by_team[team].append(int(_row_value(participant, "role_rating_snapshot")))
+                        by_team[team].append(
+                            _bounded_rating(_row_value(participant, "role_rating_snapshot"))
+                        )
                     if len(by_team["A"]) != len(by_team["B"]) or not by_team["A"]:
                         raise InvalidMatchStateError("팀 인원이 올바르지 않습니다.")
                     delta_a, delta_b = calculate_rating_delta(
@@ -1808,9 +1960,10 @@ class MatchRepository:
                     )
                     for participant_id in user_ids:
                         team, role = participant_data[participant_id]
-                        before = current_ratings[(participant_id, role)]
+                        before = _bounded_rating(current_ratings[(participant_id, role)])
                         delta = delta_a if team == "A" else delta_b
-                        after = before + delta
+                        after = _bounded_rating(before + delta)
+                        effective_delta = after - before
                         await conn.execute(
                             """UPDATE player_role_ratings
                                SET rating = $6, games_played = games_played + 1,
@@ -1826,10 +1979,11 @@ class MatchRepository:
                                    (match_id, user_id, role, rating_before,
                                     rating_delta, rating_after, created_at)
                                VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-                            match_id, participant_id, role, before, delta, after, current,
+                            match_id, participant_id, role, before, effective_delta,
+                            after, current,
                         )
                 elif bool(_row_value(game, "rating_enabled")):
-                    default_rating = int(_row_value(game, "default_rating"))
+                    default_rating = _bounded_rating(_row_value(game, "default_rating"))
                     user_ids = sorted(int(_row_value(item, "user_id")) for item in participants)
                     for user_id in user_ids:
                         await conn.execute(
@@ -1864,7 +2018,9 @@ class MatchRepository:
                         participant_team[user_id] = team
                         snapshot = _row_value(participant, "rating_snapshot")
                         by_team[team].append(
-                            current_ratings[user_id] if snapshot is None else int(snapshot)
+                            _bounded_rating(
+                                current_ratings[user_id] if snapshot is None else snapshot
+                            )
                         )
                     if not by_team["A"] or len(by_team["A"]) != len(by_team["B"]):
                         raise InvalidMatchStateError("팀 인원이 올바르지 않습니다.")
@@ -1875,9 +2031,10 @@ class MatchRepository:
                         int(_row_value(game, "k_factor")),
                     )
                     for user_id in user_ids:
-                        before = current_ratings[user_id]
+                        before = _bounded_rating(current_ratings[user_id])
                         delta = delta_a if participant_team[user_id] == "A" else delta_b
-                        after = before + delta
+                        after = _bounded_rating(before + delta)
+                        effective_delta = after - before
                         await conn.execute(
                             """UPDATE player_ratings
                                SET rating = $5, games_played = games_played + 1, updated_at = $6
@@ -1893,12 +2050,18 @@ class MatchRepository:
                                    (match_id, user_id, rating_before, rating_delta,
                                     rating_after, created_at)
                                VALUES ($1, $2, $3, $4, $5, $6)""",
-                            match_id, user_id, before, delta, after, current,
+                            match_id, user_id, before, effective_delta, after, current,
                         )
                 await conn.execute(
                     """
                     UPDATE matches SET status = 'FINISHED', ended_at = $2::timestamptz,
-                        ready_deadline_at = NULL,
+                        ready_deadline_at = NULL, recruitment_deadline_at = NULL,
+                        recruitment_reminded_at = NULL,
+                        recruitment_reminder_sent_at = NULL,
+                        recruitment_reminder_retry_at = NULL,
+                        recruitment_reminder_attempts = 0,
+                        recruitment_reminder_token = NULL,
+                        draft_deadline_at = NULL,
                         voice_cleanup_at = CASE
                             WHEN team_a_voice_channel_id IS NOT NULL
                               OR team_b_voice_channel_id IS NOT NULL
@@ -2066,7 +2229,6 @@ class MatchRepository:
                                   sum(games_played)::integer AS games_played
                            FROM player_role_ratings
                            WHERE guild_id = $1 AND game_id = $2 AND season_id = $3
-                             AND rating > 0
                            GROUP BY user_id
                            ORDER BY rating DESC, games_played DESC, user_id ASC LIMIT $4""",
                         guild_id, game_id, int(_row_value(season, "id")), int(limit),
@@ -2097,12 +2259,14 @@ class MatchRepository:
         ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
         default_recruitment_minutes: int = DEFAULT_RECRUITMENT_MINUTES,
         reminder_before_seconds: int = 300,
+        reminder_retry_seconds: int = DEFAULT_REMINDER_RETRY_SECONDS,
     ) -> list[MatchEvent]:
         current = _now(now)
         ready_timeout_seconds = _validate_timeout(ready_timeout_seconds)
         default_recruitment_minutes = _validate_recruitment_minutes(default_recruitment_minutes)
         if int(reminder_before_seconds) < 0:
             raise InvalidTimeoutError()
+        reminder_retry_seconds = _validate_timeout(reminder_retry_seconds)
         async with self.pool.acquire() as conn:
             ids = await conn.fetch(
                 """
@@ -2110,10 +2274,15 @@ class MatchRepository:
                 WHERE ended_at IS NULL AND (
                     (status = 'RECRUITING' AND recruitment_deadline_at IS NOT NULL AND
                         (recruitment_deadline_at <= $1::timestamptz OR
-                         (recruitment_reminded_at IS NULL AND
+                         (recruitment_reminder_sent_at IS NULL AND
+                          (recruitment_reminded_at IS NULL OR
+                           recruitment_reminder_retry_at IS NULL OR
+                           recruitment_reminder_retry_at <= $1::timestamptz) AND
                           recruitment_deadline_at <= $1::timestamptz + ($2 * interval '1 second'))))
                     OR (status = 'READY_CHECK' AND ready_deadline_at IS NOT NULL
                         AND ready_deadline_at <= $1::timestamptz)
+                    OR (status = 'DRAFTING' AND draft_deadline_at IS NOT NULL
+                        AND draft_deadline_at <= $1::timestamptz)
                 )
                 ORDER BY id
                 """,
@@ -2129,6 +2298,7 @@ class MatchRepository:
                     kind: str | None = None
                     removed: tuple[int, ...] = ()
                     promoted: tuple[int, ...] = ()
+                    delivery_token: str | None = None
                     if status == RECRUITING:
                         deadline = _row_value(row, "recruitment_deadline_at")
                         if deadline is None:
@@ -2150,7 +2320,13 @@ class MatchRepository:
                                     """
                                     UPDATE matches
                                     SET status = 'READY_CHECK', ready_deadline_at = $2,
-                                        recruitment_deadline_at = NULL
+                                        recruitment_deadline_at = NULL,
+                                        recruitment_reminded_at = NULL,
+                                        recruitment_reminder_sent_at = NULL,
+                                        recruitment_reminder_retry_at = NULL,
+                                        recruitment_reminder_attempts = 0,
+                                        recruitment_reminder_token = NULL,
+                                        draft_deadline_at = NULL
                                     WHERE id = $1
                                     """,
                                     match_id, current + timedelta(seconds=ready_timeout_seconds),
@@ -2160,28 +2336,54 @@ class MatchRepository:
                                     """
                                     UPDATE matches
                                     SET status = 'CANCELLED', ended_at = $2,
-                                        cancel_reason = '모집 시간 만료', ready_deadline_at = NULL
+                                        cancel_reason = '모집 시간 만료', ready_deadline_at = NULL,
+                                        recruitment_reminded_at = NULL,
+                                        recruitment_reminder_sent_at = NULL,
+                                        recruitment_reminder_retry_at = NULL,
+                                        recruitment_reminder_attempts = 0,
+                                        recruitment_reminder_token = NULL,
+                                        draft_deadline_at = NULL
                                     WHERE id = $1
                                     """,
                                     match_id, current,
                                 )
                             kind = "recruitment_expired"
                         elif (
-                            _row_value(row, "recruitment_reminded_at") is None
+                            _row_value(row, "recruitment_reminder_sent_at") is None
+                            and (
+                                _row_value(row, "recruitment_reminded_at") is None
+                                or _row_value(row, "recruitment_reminder_retry_at") is None
+                                or _row_value(row, "recruitment_reminder_retry_at") <= current
+                            )
                             and int(reminder_before_seconds) > 0
                             and deadline <= current + timedelta(seconds=int(reminder_before_seconds))
                             and _row_value(row, "created_at") is not None
                             and deadline - _row_value(row, "created_at")
                             > timedelta(seconds=int(reminder_before_seconds))
                         ):
-                            updated = await conn.execute(
+                            delivery_token = str(uuid4())
+                            claimed = await conn.fetchrow(
                                 """
-                                UPDATE matches SET recruitment_reminded_at = $2
-                                WHERE id = $1 AND recruitment_reminded_at IS NULL
+                                UPDATE matches
+                                SET recruitment_reminded_at = $2,
+                                    recruitment_reminder_retry_at = $3,
+                                    recruitment_reminder_attempts =
+                                        recruitment_reminder_attempts + 1,
+                                    recruitment_reminder_token = $4
+                                WHERE id = $1 AND status = 'RECRUITING'
+                                  AND recruitment_reminder_sent_at IS NULL
+                                  AND (
+                                      recruitment_reminded_at IS NULL
+                                      OR recruitment_reminder_retry_at IS NULL
+                                      OR recruitment_reminder_retry_at <= $2
+                                  )
+                                RETURNING recruitment_reminder_attempts
                                 """,
                                 match_id, current,
+                                current + timedelta(seconds=reminder_retry_seconds),
+                                delivery_token,
                             )
-                            if updated.endswith("1"):
+                            if claimed is not None:
                                 kind = "recruitment_reminder"
                     elif status == READY_CHECK:
                         deadline = _row_value(row, "ready_deadline_at")
@@ -2210,10 +2412,32 @@ class MatchRepository:
                             ready_timeout_seconds, default_recruitment_minutes,
                         )
                         kind = "ready_expired"
+                    elif status == DRAFTING:
+                        deadline = _row_value(row, "draft_deadline_at")
+                        if deadline is None or deadline > current:
+                            continue
+                        await conn.execute(
+                            """
+                            UPDATE matches
+                            SET status = 'CANCELLED', ended_at = $2,
+                                ready_deadline_at = NULL,
+                                recruitment_deadline_at = NULL,
+                                recruitment_reminded_at = NULL,
+                                recruitment_reminder_sent_at = NULL,
+                                recruitment_reminder_retry_at = NULL,
+                                recruitment_reminder_attempts = 0,
+                                recruitment_reminder_token = NULL,
+                                draft_deadline_at = NULL,
+                                cancel_reason = '지명 시간 만료'
+                            WHERE id = $1 AND status = 'DRAFTING' AND ended_at IS NULL
+                            """,
+                            match_id, current,
+                        )
+                        kind = "draft_expired"
                     if kind is not None:
                         events.append(MatchEvent(
                             await self._fetch_match(conn, match_id), kind,
-                            removed, promoted,
+                            removed, promoted, delivery_token,
                         ))
             return events
 
@@ -2421,6 +2645,86 @@ class MatchRepository:
                 )
                 return await self._fetch_match(conn, match_id)
 
+    async def attach_message_id(
+        self,
+        match_id: int,
+        message_id: int,
+        *,
+        expected_old: int | None = None,
+    ) -> Match:
+        """Attach a Discord panel ID without clobbering a newer publisher.
+
+        A process can crash after Discord accepts a message but before the ID
+        is persisted.  Recovery may therefore have multiple publishers.  The
+        conditional update makes the first committed binding authoritative;
+        callers can pass ``expected_old`` when replacing a deleted/stale ID.
+        """
+
+        if int(message_id) <= 0:
+            raise ValueError("message_id는 양의 정수여야 합니다.")
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await self._locked_match(conn, match_id)
+                current = _row_value(row, "message_id")
+                if expected_old is None:
+                    if current is None:
+                        await conn.execute(
+                            "UPDATE matches SET message_id = $2 WHERE id = $1 AND message_id IS NULL",
+                            match_id, int(message_id),
+                        )
+                elif current is not None and int(current) == int(expected_old):
+                    await conn.execute(
+                        "UPDATE matches SET message_id = $2 WHERE id = $1 AND message_id = $3",
+                        match_id, int(message_id), int(expected_old),
+                    )
+                return await self._fetch_match(conn, match_id)
+
+    async def acknowledge_recruitment_reminder(
+        self,
+        match_id: int,
+        token: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Mark a claimed reminder delivered, iff this attempt still owns it."""
+
+        current = _now(now)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """UPDATE matches
+                       SET recruitment_reminder_sent_at = $3,
+                           recruitment_reminder_retry_at = NULL
+                       WHERE id = $1 AND status = 'RECRUITING'
+                         AND recruitment_reminder_sent_at IS NULL
+                         AND recruitment_reminder_token = $2::uuid
+                       RETURNING id""",
+                    match_id, token, current,
+                )
+                return row is not None
+
+    async def retry_recruitment_reminder(
+        self,
+        match_id: int,
+        token: str,
+        retry_at: datetime,
+    ) -> bool:
+        """Release a failed reminder claim for a later poll, token-safely."""
+
+        retry_at = _now(retry_at)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """UPDATE matches
+                       SET recruitment_reminder_retry_at = $3
+                       WHERE id = $1 AND status = 'RECRUITING'
+                         AND recruitment_reminder_sent_at IS NULL
+                         AND recruitment_reminder_token = $2::uuid
+                       RETURNING id""",
+                    match_id, token, retry_at,
+                )
+                return row is not None
+
     async def cancel_missing_message(
         self, match_id: int, *, voice_cleanup_delay_seconds: int = 600
     ) -> Match:
@@ -2432,7 +2736,14 @@ class MatchRepository:
                     await conn.execute(
                         """
                         UPDATE matches SET status = 'CANCELLED', ended_at = now(),
-                            ready_deadline_at = NULL, cancel_reason = '모집 메시지를 찾을 수 없음',
+                            ready_deadline_at = NULL, recruitment_deadline_at = NULL,
+                            recruitment_reminded_at = NULL,
+                            recruitment_reminder_sent_at = NULL,
+                            recruitment_reminder_retry_at = NULL,
+                            recruitment_reminder_attempts = 0,
+                            recruitment_reminder_token = NULL,
+                            draft_deadline_at = NULL,
+                            cancel_reason = '모집 메시지를 찾을 수 없음',
                             voice_cleanup_at = CASE
                                 WHEN team_a_voice_channel_id IS NOT NULL
                                   OR team_b_voice_channel_id IS NOT NULL
