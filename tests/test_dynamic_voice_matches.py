@@ -98,6 +98,38 @@ async def test_voice_ids_constraint_cleanup_schedule_and_partial_clear(service_a
 
 
 @pytest.mark.asyncio
+async def test_cancel_playing_match_schedules_voice_cleanup(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    service.voice_cleanup_delay_seconds = 600
+    key = await _game(service, guild_id)
+    match = await _playing(service, guild_id, channel_id, 1, 2, key, 10)
+    match = await service.set_voice_channel_id(match.id, "A", 1001)
+    match = await service.set_voice_channel_id(match.id, "B", 1002)
+    assert match.status == "PLAYING"
+    assert (match.team_a_voice_channel_id, match.team_b_voice_channel_id) == (1001, 1002)
+
+    cancelled = await service.cancel_match(match.id, 1, now=T0)
+
+    assert cancelled.status == "CANCELLED"
+    assert cancelled.ended_at == T0
+    assert cancelled.voice_cleanup_at == T0 + timedelta(seconds=600)
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_voice_channels_has_no_cleanup_schedule(service_and_scope):
+    service, guild_id, channel_id = service_and_scope
+    service.voice_cleanup_delay_seconds = 600
+    key = await _game(service, guild_id)
+    match = await _playing(service, guild_id, channel_id, 1, 2, key, 10)
+
+    cancelled = await service.cancel_match(match.id, 1, now=T0)
+
+    assert cancelled.status == "CANCELLED"
+    assert cancelled.ended_at == T0
+    assert cancelled.voice_cleanup_at is None
+
+
+@pytest.mark.asyncio
 async def test_empty_voice_claim_is_conditional_and_closed_channel_stays_closed(service_and_scope):
     service, guild_id, channel_id = service_and_scope
     key = await _game(service, guild_id)

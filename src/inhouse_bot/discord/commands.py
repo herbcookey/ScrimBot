@@ -123,6 +123,58 @@ class MatchCommandGroup(app_commands.Group):
             except TypeError:
                 await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    @app_commands.command(name="사용법", description="내전 봇의 명령과 진행 방법을 확인합니다.")
+    async def usage(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title="내전 봇 사용법",
+            description=(
+                "모든 명령은 `/내전`으로 시작합니다. "
+                "`[대괄호]`로 표시한 옵션은 생략할 수 있습니다."
+            ),
+            colour=0x5865F2,
+        )
+        embed.add_field(
+            name="1. 내전 만들기",
+            value=(
+                "`/내전 생성 제목 [모집시간] [게임] [방식] [1지망] [2지망] [3지망]`\n"
+                "라인 MMR 내전은 선택할 모든 지망을 `/내전 등록`으로 먼저 등록해야 합니다.\n"
+                "생성된 카드에서 **참가 → 준비 확인 시작 → 준비** 순으로 진행합니다. "
+                "참가를 취소하려면 **나가기** 버튼을 누릅니다."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="2. 진행 중 명령",
+            value=(
+                "`/내전 라인변경 1지망 2지망 [3지망]` · 모집/준비 확인 중 지망 변경\n"
+                "`/내전 지명 사용자` · Draft 현재 차례의 주장 선택\n"
+                "`/내전 결과 승리팀 [메모]` · 생성자 또는 관리자가 결과 기록\n"
+                "카드의 **내전 취소**와 `/내전 강퇴 사용자`도 생성자 또는 관리자가 사용합니다."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="3. MMR과 기록",
+            value=(
+                "`/내전 등록 라인 티어 [게임]` · 내 현재 시즌 라인 MMR 등록\n"
+                "`/내전 전적 [사용자] [게임] [시즌]` · 전적과 승률 조회\n"
+                "`/내전 랭킹 [게임] [시즌] [라인] [인원수]` · 시즌 MMR 순위 조회"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="4. 관리자 명령",
+            value=(
+                "`/내전 시즌시작 이름 [게임]` · `/내전 시즌종료 [게임]`\n"
+                "`/내전 mmr설정 사용자 라인 [티어] [점수] [게임]`\n"
+                "`/내전 관리자추가 사용자` · `/내전 관리자삭제 사용자` · "
+                "`/내전 관리자목록`"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="세부 옵션은 /내전 입력 후 Discord 자동완성에서 확인하세요.")
+        await self._send_embed(interaction, embed)
+
     @app_commands.command(name="생성", description="새 내전을 생성합니다.")
     @app_commands.describe(
         title="내전 제목", recruitment_minutes="모집시간(분)", game="게임",

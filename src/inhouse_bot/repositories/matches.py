@@ -1697,12 +1697,12 @@ class MatchRepository:
                 await conn.execute(
                     """
                     UPDATE matches
-                    SET status = 'CANCELLED', ended_at = $2,
+                    SET status = 'CANCELLED', ended_at = $2::timestamptz,
                         ready_deadline_at = NULL, cancel_reason = $3,
                         voice_cleanup_at = CASE
                             WHEN team_a_voice_channel_id IS NOT NULL
                               OR team_b_voice_channel_id IS NOT NULL
-                            THEN $2 + ($4 * interval '1 second')
+                            THEN $2::timestamptz + ($4 * interval '1 second')
                             ELSE NULL END
                     WHERE id = $1
                     """,
@@ -1897,12 +1897,12 @@ class MatchRepository:
                         )
                 await conn.execute(
                     """
-                    UPDATE matches SET status = 'FINISHED', ended_at = $2,
+                    UPDATE matches SET status = 'FINISHED', ended_at = $2::timestamptz,
                         ready_deadline_at = NULL,
                         voice_cleanup_at = CASE
                             WHEN team_a_voice_channel_id IS NOT NULL
                               OR team_b_voice_channel_id IS NOT NULL
-                            THEN $2 + ($3 * interval '1 second')
+                            THEN $2::timestamptz + ($3 * interval '1 second')
                             ELSE NULL END
                     WHERE id = $1
                     """,
@@ -2109,11 +2109,11 @@ class MatchRepository:
                 SELECT id FROM matches
                 WHERE ended_at IS NULL AND (
                     (status = 'RECRUITING' AND recruitment_deadline_at IS NOT NULL AND
-                        (recruitment_deadline_at <= $1 OR
+                        (recruitment_deadline_at <= $1::timestamptz OR
                          (recruitment_reminded_at IS NULL AND
-                          recruitment_deadline_at <= $1 + ($2 * interval '1 second'))))
+                          recruitment_deadline_at <= $1::timestamptz + ($2 * interval '1 second'))))
                     OR (status = 'READY_CHECK' AND ready_deadline_at IS NOT NULL
-                        AND ready_deadline_at <= $1)
+                        AND ready_deadline_at <= $1::timestamptz)
                 )
                 ORDER BY id
                 """,

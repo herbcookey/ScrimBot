@@ -200,6 +200,41 @@ def test_phase3b_command_options_and_names():
     assert "user" not in MatchCommandGroup.register._params
 
 
+@pytest.mark.asyncio
+async def test_usage_command_sends_ephemeral_command_guide():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    group = MatchCommandGroup(SimpleNamespace())
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+
+    await MatchCommandGroup.usage.callback(group, interaction)
+
+    assert MatchCommandGroup.usage.name == "사용법"
+    kwargs = interaction.followup.send.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    embed = kwargs["embed"]
+    assert embed.title == "내전 봇 사용법"
+    guide = "\n".join(
+        [embed.description or ""]
+        + [f"{field.name}\n{field.value}" for field in embed.fields]
+    )
+    for command in (
+        "/내전 생성",
+        "/내전 라인변경",
+        "/내전 지명",
+        "/내전 결과",
+        "/내전 등록",
+        "/내전 전적",
+        "/내전 랭킹",
+        "/내전 시즌시작",
+        "/내전 mmr설정",
+        "/내전 관리자목록",
+    ):
+        assert command in guide
+    assert "선택할 모든 지망" in guide
+    assert "모집/준비 확인 중" in guide
+
+
 def _command_interaction(*, channel_type=None, manage_guild=False, guild=True):
     response = SimpleNamespace(is_done=lambda: True, send_message=AsyncMock(), defer=AsyncMock())
     followup = SimpleNamespace(send=AsyncMock())
