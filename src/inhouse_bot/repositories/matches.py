@@ -43,6 +43,7 @@ DEFAULT_DRAFT_TIMEOUT_SECONDS = 120
 DEFAULT_REMINDER_RETRY_SECONDS = 60
 MIN_RATING = 0
 MAX_RATING = 10000
+SEASON_NAME_MAX_LENGTH = 100
 
 
 class MatchError(RuntimeError):
@@ -1152,6 +1153,10 @@ class MatchRepository:
         name = name.strip()
         if not name:
             raise InvalidSeasonStateError("시즌 이름을 입력해야 합니다.")
+        if len(name) > SEASON_NAME_MAX_LENGTH:
+            raise InvalidSeasonStateError(
+                f"시즌 이름은 {SEASON_NAME_MAX_LENGTH}자 이내로 입력해 주세요."
+            )
         current = _now(now)
         async with self.pool.acquire() as conn:
             async with conn.transaction():

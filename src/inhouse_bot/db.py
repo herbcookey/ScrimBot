@@ -8,6 +8,7 @@ async def create_pool(database_url: str, **kwargs: Any) -> Any:
 
     import asyncpg
 
+    kwargs.setdefault("min_size", 1)
     return await asyncpg.create_pool(dsn=database_url, **kwargs)
 
 

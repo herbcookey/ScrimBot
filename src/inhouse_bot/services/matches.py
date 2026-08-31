@@ -34,6 +34,7 @@ from inhouse_bot.repositories.matches import (
     MatchFullError,
     MatchNotFoundError,
     MatchRepository,
+    SEASON_NAME_MAX_LENGTH,
     MatchResult,
     MatchStats,
     RoleAssignmentImpossibleError,
@@ -104,7 +105,17 @@ class MatchService:
         self.default_recruitment_minutes = int(default_recruitment_minutes)
         self.reminder_before_seconds = int(reminder_before_seconds)
         self.reminder_retry_seconds = int(reminder_retry_seconds)
+        self._voice_retry_match_ids: set[int] = set()
         self.voice_cleanup_delay_seconds = int(voice_cleanup_delay_seconds)
+
+    def retry_voice_for(self, match_id: int) -> None:
+        self._voice_retry_match_ids.add(int(match_id))
+
+    def clear_voice_retry(self, match_id: int) -> None:
+        self._voice_retry_match_ids.discard(int(match_id))
+
+    def voice_retry_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._voice_retry_match_ids))
 
     async def is_bot_owner(self, user_id: int) -> bool:
         return int(user_id) == self.bot_owner_id
@@ -386,6 +397,15 @@ class MatchService:
         manager_override: bool = False,
         now: datetime | None = None,
     ) -> Season:
+        if not manager_override:
+            raise PermissionDeniedError("봇 관리자 권한이 필요합니다.")
+        name = name.strip()
+        if not name:
+            raise InvalidSeasonStateError("시즌 이름을 입력해야 합니다.")
+        if len(name) > SEASON_NAME_MAX_LENGTH:
+            raise InvalidSeasonStateError(
+                f"시즌 이름은 {SEASON_NAME_MAX_LENGTH}자 이내로 입력해 주세요."
+            )
         return await self.repository.start_season(
             guild_id, name, game_key=game_key, manager_override=manager_override, now=now
         )

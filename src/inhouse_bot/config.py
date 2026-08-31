@@ -29,7 +29,7 @@ def load_settings() -> Settings:
     missing = [
         name
         for name in ("DISCORD_TOKEN", "DISCORD_GUILD_ID", "BOT_OWNER_ID", "DATABASE_URL")
-        if not os.getenv(name)
+        if not (os.getenv(name) or "").strip()
     ]
     if missing:
         raise RuntimeError(f"필수 환경변수가 없습니다: {', '.join(missing)}")
@@ -38,6 +38,8 @@ def load_settings() -> Settings:
         guild_id = int(os.environ["DISCORD_GUILD_ID"])
     except ValueError as exc:
         raise RuntimeError("DISCORD_GUILD_ID는 정수여야 합니다") from exc
+    if guild_id <= 0:
+        raise RuntimeError("DISCORD_GUILD_ID는 양의 정수여야 합니다")
 
     bot_owner_id = _positive_int("BOT_OWNER_ID", 0)
 
@@ -53,14 +55,14 @@ def load_settings() -> Settings:
     team_b_voice_channel_id = _optional_int("TEAM_B_VOICE_CHANNEL_ID")
     if team_a_voice_channel_id is not None and team_a_voice_channel_id == team_b_voice_channel_id:
         raise RuntimeError("A팀과 B팀 음성 채널 ID는 달라야 합니다")
-    if team_a_voice_channel_id is None or team_b_voice_channel_id is None:
-        team_a_voice_channel_id = team_b_voice_channel_id = None
+    if (team_a_voice_channel_id is None) != (team_b_voice_channel_id is None):
+        raise RuntimeError("A팀과 B팀 음성 채널 ID는 둘 다 설정하거나 둘 다 생략해야 합니다")
 
     return Settings(
-        discord_token=os.environ["DISCORD_TOKEN"],
+        discord_token=os.environ["DISCORD_TOKEN"].strip(),
         discord_guild_id=guild_id,
         bot_owner_id=bot_owner_id,
-        database_url=os.environ["DATABASE_URL"],
+        database_url=os.environ["DATABASE_URL"].strip(),
         ready_timeout_seconds=ready_timeout_seconds,
         draft_timeout_seconds=draft_timeout_seconds,
         default_recruitment_minutes=default_recruitment_minutes,

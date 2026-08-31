@@ -218,9 +218,11 @@ supabase db push
 python -m pytest
 ```
 
-실제 통합 테스트는 별도 PostgreSQL DB를 만들고 `TEST_DATABASE_URL`만 설정해 실행합니다. fixture가 해당 DB에 migration을 적용하고 테스트 데이터를 만들고 지우므로 운영 DB를 절대 지정하지 마세요. 시간 만료 테스트는 고정된 `now`를 `process_due_matches(now)`에 전달하며 실제 `sleep`/대기를 사용하지 않습니다.
+실제 통합 테스트는 별도 PostgreSQL DB를 만들고 아래 sentinel을 한 번 설정한 뒤 다시 연결해 실행합니다. fixture는 sentinel이 정확히 `true`인 DB에만 migration과 cleanup을 실행합니다. 시간 만료 테스트는 고정된 `now`를 `process_due_matches(now)`에 전달하며 실제 `sleep`/대기를 사용하지 않습니다.
 
 ```powershell
+# 테스트 DB 관리자 연결에서 한 번 실행한 뒤 연결을 끊습니다.
+ALTER DATABASE <test-db> SET inhouse_bot.test_database = 'true';
 $env:TEST_DATABASE_URL = "postgresql://<test-user>:<password>@<host>:5432/<test-db>"
 python -m pytest tests/test_matches.py
 ```

@@ -481,6 +481,87 @@ async def test_admin_commands_defer_before_remote_permission_check(command_name)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command_name", ("admin_list", "season_start", "season_end", "set_mmr"))
+async def test_admin_commands_reply_when_permission_check_fails(command_name):
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(is_bot_admin=AsyncMock(side_effect=RuntimeError("db down")))
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    if command_name == "admin_list":
+        await MatchCommandGroup.admin_list.callback(group, interaction)
+    elif command_name == "season_start":
+        await MatchCommandGroup.season_start.callback(group, interaction, "시즌", None)
+    elif command_name == "season_end":
+        await MatchCommandGroup.season_end.callback(group, interaction, None)
+    else:
+        role = discord.app_commands.Choice(name="원딜", value="ADC")
+        await MatchCommandGroup.set_mmr.callback(
+            group, interaction, SimpleNamespace(id=88), role, "플래티넘2", None, "lol"
+        )
+    assert "오류" in interaction.followup.send.await_args.args[0]
+
+
+def test_match_panel_requires_own_bot_and_exact_component():
+    from inhouse_bot.main import InhouseBot
+
+    bot = SimpleNamespace(user=SimpleNamespace(id=7), application_id=7)
+
+    def message(author_id, custom_id=None, content=""):
+        children = () if custom_id is None else (SimpleNamespace(custom_id=custom_id),)
+        return SimpleNamespace(
+            author=SimpleNamespace(id=author_id, bot=author_id == 7),
+            application_id=None,
+            components=(SimpleNamespace(children=children),),
+            content=content,
+        )
+
+    assert not InhouseBot._is_match_panel(bot, message(8, content="hello match:42"), 42)
+    assert not InhouseBot._is_match_panel(bot, message(7, "match:10:join"), 1)
+    assert not InhouseBot._is_match_panel(bot, message(7, content="match:42"), 42)
+    assert InhouseBot._is_match_panel(bot, message(7, "match:42:join"), 42)
+
+
+def test_renderer_caps_large_waitlist():
+    waiting = tuple(_participant(user_id) for user_id in range(1000, 1100))
+    match = SimpleNamespace(
+        status="RECRUITING", title="대기열", capacity=10, participants=(),
+        waitlist=waiting, recruitment_deadline_at=None, role_rating_enabled=False,
+    )
+    value = _fields(render_match(match))["대기자"]
+    assert len(value) <= 1024
+    assert "<@1024>" in value and "<@1025>" not in value
+    assert "외 75명" in value
+
+
+@pytest.mark.asyncio
+async def test_result_cleanup_failure_still_reports_success(monkeypatch):
+    import inhouse_bot.discord.commands as commands_module
+
+    finished = SimpleNamespace(id=42, voice_cleanup_at=None)
+    service = SimpleNamespace(
+        get_active_match=AsyncMock(return_value=finished),
+        finish_match=AsyncMock(return_value=finished),
+        get_match=AsyncMock(return_value=finished),
+        is_bot_admin=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        commands_module,
+        "close_empty_match_voice_channels",
+        AsyncMock(side_effect=RuntimeError("cleanup")),
+    )
+    group = commands_module.MatchCommandGroup(service)
+    group._refresh_message = AsyncMock()
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    interaction.channel.id = 456
+    await commands_module.MatchCommandGroup.result.callback(
+        group, interaction, discord.app_commands.Choice(name="A팀", value="A"), None
+    )
+    service.finish_match.assert_awaited_once()
+    assert interaction.followup.send.await_args.args[0] == "내전 결과를 기록했습니다."
+
+
+@pytest.mark.asyncio
 async def test_role_join_modal_does_not_wait_for_match_when_role_state_is_known():
     from inhouse_bot.discord.views import MatchView
 
@@ -680,6 +761,38 @@ def test_load_settings_rejects_duplicate_voice_channels(monkeypatch):
     monkeypatch.setenv("TEAM_A_VOICE_CHANNEL_ID", "42")
     monkeypatch.setenv("TEAM_B_VOICE_CHANNEL_ID", "42")
     with pytest.raises(RuntimeError, match="달라야 합니다"):
+        load_settings()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (("DISCORD_TOKEN", "   "), ("DATABASE_URL", "\t"), ("DISCORD_GUILD_ID", "0"),
+     ("DISCORD_GUILD_ID", "-1")),
+)
+def test_load_settings_rejects_blank_required_and_nonpositive_guild(monkeypatch, name, value):
+    from inhouse_bot.config import load_settings
+
+    monkeypatch.setattr("inhouse_bot.config.load_dotenv", lambda: None)
+    monkeypatch.setenv("DISCORD_TOKEN", "token")
+    monkeypatch.setenv("DISCORD_GUILD_ID", "1")
+    monkeypatch.setenv("BOT_OWNER_ID", "99")
+    monkeypatch.setenv("DATABASE_URL", "postgres://localhost/test")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError):
+        load_settings()
+
+
+def test_load_settings_rejects_only_one_fixed_voice_channel(monkeypatch):
+    from inhouse_bot.config import load_settings
+
+    monkeypatch.setattr("inhouse_bot.config.load_dotenv", lambda: None)
+    monkeypatch.setenv("DISCORD_TOKEN", "token")
+    monkeypatch.setenv("DISCORD_GUILD_ID", "1")
+    monkeypatch.setenv("BOT_OWNER_ID", "99")
+    monkeypatch.setenv("DATABASE_URL", "postgres://localhost/test")
+    monkeypatch.setenv("TEAM_A_VOICE_CHANNEL_ID", "42")
+    monkeypatch.delenv("TEAM_B_VOICE_CHANNEL_ID", raising=False)
+    with pytest.raises(RuntimeError, match="둘 다"):
         load_settings()
 
 

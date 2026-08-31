@@ -23,6 +23,19 @@ if TEST_DATABASE_URL and os.getenv("DATABASE_URL") == TEST_DATABASE_URL:
 asyncpg = pytest.importorskip("asyncpg")
 
 
+async def _require_test_database(conn) -> None:
+    is_test_database = await conn.fetchval(
+        "SELECT current_setting('inhouse_bot.test_database', true) = 'true'"
+    )
+    if not is_test_database:
+        pytest.fail(
+            "테스트 DB sentinel이 없습니다. 전용 DB에 "
+            "ALTER DATABASE <db> SET inhouse_bot.test_database = 'true'를 "
+            "설정하고 다시 연결하세요.",
+            pytrace=False,
+        )
+
+
 async def _migration_applied(conn, migration_name: str) -> bool:
     """이미 적용된 migration은 다시 실행하지 않는다.
 
@@ -98,6 +111,25 @@ async def _migration_applied(conn, migration_name: str) -> bool:
         return bool(await conn.fetchval(
             "SELECT to_regclass('public.bot_admins') IS NOT NULL"
         ))
+    if migration_name.startswith("20260831013642"):
+        return bool(await conn.fetchval(
+            """
+            SELECT EXISTS (
+                       SELECT 1 FROM pg_constraint
+                       WHERE conrelid = 'public.seasons'::regclass
+                         AND conname = 'seasons_name_length_check'
+                   )
+               AND EXISTS (
+                       SELECT 1 FROM pg_constraint
+                       WHERE conrelid = 'public.match_participants'::regclass
+                         AND conname = 'match_participants_preferences_check'
+                         AND pg_get_constraintdef(oid) LIKE '%IS NOT NULL%'
+                   )
+               AND to_regclass(
+                       'public.match_participants_user_id_match_id_idx'
+                   ) IS NOT NULL
+            """
+        ))
     return False
 
 
@@ -114,6 +146,7 @@ async def db_pool():
     pool = await asyncpg.create_pool(TEST_DATABASE_URL, min_size=1, max_size=10)
     try:
         async with pool.acquire() as conn:
+            await _require_test_database(conn)
             for migration_path in migration_paths:
                 if await _migration_applied(conn, migration_path.name):
                     continue
@@ -135,6 +168,7 @@ async def service_and_scope(db_pool, request):
     legacy_mode = request.module.__name__.endswith("test_matches")
     if legacy_mode:
         async with db_pool.acquire() as conn:
+            await _require_test_database(conn)
             await conn.execute(
                 "UPDATE games SET role_rating_enabled = FALSE WHERE \"key\" = 'lol'"
             )
@@ -142,6 +176,7 @@ async def service_and_scope(db_pool, request):
         yield service, guild_id, channel_id
     finally:
         async with db_pool.acquire() as conn:
+            await _require_test_database(conn)
             # 전적 테스트에서 서버 분리를 보려고 guild_id + 1도 쓴다.
             # 다음 테스트에 남지 않게 둘 다 지운다.
             await conn.execute(

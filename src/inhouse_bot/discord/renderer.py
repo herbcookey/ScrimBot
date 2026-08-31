@@ -19,6 +19,7 @@ _STATUS_LABELS = {
     "FINISHED": "종료",
     "CANCELLED": "취소됨",
 }
+_WAITLIST_DISPLAY_LIMIT = 25
 
 
 def _get(value: Any, name: str, default: Any = None) -> Any:
@@ -138,9 +139,18 @@ def render_match(match: Any) -> discord.Embed:
     if season_name:
         embed.add_field(name="시즌", value=str(season_name), inline=True)
     if waiting:
+        shown = waiting[:_WAITLIST_DISPLAY_LIMIT]
+        omitted = len(waiting) - len(shown)
+        value = f"{len(waiting)}명\n{_roster(shown, show_preferences=role_enabled)}"
+        if omitted:
+            value += f"\n외 {omitted}명"
+        if len(value) > 1024:
+            value = f"{len(waiting)}명\n{_roster(shown)}"
+            if omitted:
+                value += f"\n외 {omitted}명"
         embed.add_field(
             name="대기자",
-            value=f"{len(waiting)}명\n{_roster(waiting, show_preferences=role_enabled)}",
+            value=value,
             inline=True,
         )
 

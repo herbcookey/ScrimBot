@@ -256,11 +256,22 @@ class MatchView(discord.ui.View):
 
     async def _move_voice(self, interaction: discord.Interaction, match: Any) -> VoiceMoveSummary:
         guild = getattr(interaction, "guild", None)
-        summary = await ensure_match_voice_channels(
-            self.service, guild, match,
-            self.team_a_voice_channel_id,
-            self.team_b_voice_channel_id,
+        try:
+            summary = await ensure_match_voice_channels(
+                self.service, guild, match,
+                self.team_a_voice_channel_id,
+                self.team_b_voice_channel_id,
+            )
+        except Exception as exc:
+            logger.exception("내전 보이스 생성 실패", extra={"match_id": self.match_id})
+            summary = VoiceMoveSummary(error=str(exc) or "보이스 채널을 준비하지 못했습니다.")
+        retry = getattr(
+            self.service,
+            "retry_voice_for" if summary.error else "clear_voice_retry",
+            None,
         )
+        if callable(retry):
+            retry(self.match_id)
         await self._refresh(interaction)
         creator_id = _get(match, "creator_id")
         channel = getattr(interaction, "channel", None)
@@ -407,9 +418,12 @@ class MatchView(discord.ui.View):
                 actor_id,
                 manager_override=await self._is_bot_admin(interaction),
             )
-            await close_empty_match_voice_channels(
-                self.service, getattr(interaction, "guild", None), result
-            )
+            try:
+                await close_empty_match_voice_channels(
+                    self.service, getattr(interaction, "guild", None), result
+                )
+            except Exception:
+                logger.exception("취소된 내전 보이스 정리 예약 실패", extra={"match_id": self.match_id})
             return await self.service.get_match(self.match_id) or result
 
         await self._run(

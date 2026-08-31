@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 
 from inhouse_bot import __version__
-from inhouse_bot.repositories.matches import MatchError
+from inhouse_bot.repositories.matches import MatchError, SEASON_NAME_MAX_LENGTH
 from inhouse_bot.role_assignment import (
     ROLE_LABELS,
     RoleAssignmentError,
@@ -21,6 +21,7 @@ from inhouse_bot.role_assignment import (
 from .renderer import render_match
 from .views import MatchView, SAFE_MENTIONS
 from .voice import (
+    VoiceMoveSummary,
     close_empty_match_voice_channels,
     ensure_match_voice_channels,
     resolve_voice_category_id,
@@ -408,10 +409,10 @@ class MatchCommandGroup(app_commands.Group):
         # interaction before waiting on it so a slow database cannot expire
         # Discord's initial response window.
         await self._defer(interaction)
-        if not await self._is_bot_admin(interaction):
-            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
-            return
         try:
+            if not await self._is_bot_admin(interaction):
+                await self._send(interaction, "봇 관리자 권한이 필요합니다.")
+                return
             admins = tuple(await self.service.list_bot_admins(int(interaction.guild.id)) or ())
             user_ids = []
             owner_id = getattr(self.service, "bot_owner_id", None)
@@ -536,7 +537,7 @@ class MatchCommandGroup(app_commands.Group):
     async def season_start(
         self,
         interaction: discord.Interaction,
-        name: str,
+        name: app_commands.Range[str, 1, SEASON_NAME_MAX_LENGTH],
         game: str | None = None,
     ) -> None:
         if interaction.guild is None:
@@ -544,10 +545,19 @@ class MatchCommandGroup(app_commands.Group):
             return
         # ``_is_bot_admin`` can await PostgreSQL; defer first.
         await self._defer(interaction)
-        if not await self._is_bot_admin(interaction):
-            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
-            return
         try:
+            if not name.strip():
+                await self._send(interaction, "시즌 이름을 입력해 주세요.")
+                return
+            if len(name.strip()) > SEASON_NAME_MAX_LENGTH:
+                await self._send(
+                    interaction,
+                    f"시즌 이름은 {SEASON_NAME_MAX_LENGTH}자 이내로 입력해 주세요.",
+                )
+                return
+            if not await self._is_bot_admin(interaction):
+                await self._send(interaction, "봇 관리자 권한이 필요합니다.")
+                return
             season = await self.service.start_season(
                 int(interaction.guild.id),
                 name,
@@ -574,10 +584,10 @@ class MatchCommandGroup(app_commands.Group):
             return
         # ``_is_bot_admin`` can await PostgreSQL; defer first.
         await self._defer(interaction)
-        if not await self._is_bot_admin(interaction):
-            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
-            return
         try:
+            if not await self._is_bot_admin(interaction):
+                await self._send(interaction, "봇 관리자 권한이 필요합니다.")
+                return
             season = await self.service.end_season(
                 int(interaction.guild.id),
                 game_key=game or "lol",
@@ -731,19 +741,15 @@ class MatchCommandGroup(app_commands.Group):
             return
         # Keep all remote permission work after the acknowledgement.
         await self._defer(interaction)
-        if not await self._is_bot_admin(interaction):
-            await self._send(interaction, "봇 관리자 권한이 필요합니다.")
-            return
-        if tier is None and rating is None:
-            await self._send(interaction, "티어 또는 직접 지정 점수가 필요합니다.")
-            return
-        if rating is None:
-            try:
-                parse_compact_tier(tier or "")
-            except RoleAssignmentError as exc:
-                await self._send(interaction, str(exc))
-                return
         try:
+            if not await self._is_bot_admin(interaction):
+                await self._send(interaction, "봇 관리자 권한이 필요합니다.")
+                return
+            if tier is None and rating is None:
+                await self._send(interaction, "티어 또는 직접 지정 점수가 필요합니다.")
+                return
+            if rating is None:
+                parse_compact_tier(tier or "")
             value = await self.service.set_role_rating(
                 int(interaction.guild.id), int(user.id), _choice_value(role),
                 game_key=game or "lol", tier=tier,
@@ -754,6 +760,8 @@ class MatchCommandGroup(app_commands.Group):
                 interaction,
                 f"<@{int(user.id)}> {ROLE_LABELS.get(_choice_value(role), _choice_value(role))} MMR을 {value}점으로 설정했습니다.",
             )
+        except RoleAssignmentError as exc:
+            await self._send(interaction, str(exc))
         except MatchError as exc:
             await self._send(interaction, str(exc))
         except Exception:
@@ -781,10 +789,23 @@ class MatchCommandGroup(app_commands.Group):
             )
             await self._refresh_message(interaction, match_id)
             if bool(_get(result, "started", False)):
-                voice_summary = await ensure_match_voice_channels(
-                    self.service, interaction.guild, result,
-                    self.team_a_voice_channel_id, self.team_b_voice_channel_id,
+                try:
+                    voice_summary = await ensure_match_voice_channels(
+                        self.service, interaction.guild, result,
+                        self.team_a_voice_channel_id, self.team_b_voice_channel_id,
+                    )
+                except Exception as exc:
+                    logger.exception("Draft 종료 후 보이스 생성 실패", extra={"match_id": match_id})
+                    voice_summary = VoiceMoveSummary(
+                        error=str(exc) or "보이스 채널을 준비하지 못했습니다."
+                    )
+                retry = getattr(
+                    self.service,
+                    "retry_voice_for" if voice_summary.error else "clear_voice_retry",
+                    None,
                 )
+                if callable(retry):
+                    retry(match_id)
                 await self._refresh_message(interaction, match_id)
                 text = "지명이 끝나 내전을 시작했습니다."
                 if voice_summary.error:
@@ -836,9 +857,12 @@ class MatchCommandGroup(app_commands.Group):
                 memo=memo,
                 manager_override=await self._is_bot_admin(interaction),
             )
-            await close_empty_match_voice_channels(
-                self.service, interaction.guild, finished
-            )
+            try:
+                await close_empty_match_voice_channels(
+                    self.service, interaction.guild, finished
+                )
+            except Exception:
+                logger.exception("종료된 내전 보이스 정리 예약 실패", extra={"match_id": match_id})
             finished = await self.service.get_match(match_id) or finished
             await self._refresh_message(interaction, match_id)
             text = "내전 결과를 기록했습니다."

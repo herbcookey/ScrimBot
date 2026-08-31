@@ -154,6 +154,7 @@ class InhouseBot(commands.Bot):
             except Exception:
                 logger.exception("만료 내전 알림 전송 실패", extra={"match_id": _get(event, "match_id")})
         await self._repair_panel_less_matches()
+        await self._retry_match_voice_channels()
         await self.process_voice_cleanups()
         return events
 
@@ -175,18 +176,29 @@ class InhouseBot(commands.Bot):
             team_b_voice_channel_id=self.settings.team_b_voice_channel_id,
         )
 
-    @staticmethod
-    def _is_match_panel(message: Any, match_id: int) -> bool:
+    def _is_match_panel(self, message: Any, match_id: int) -> bool:
         """Recognize a previously posted panel without relying on its text."""
 
+        author_id = _get(_get(message, "author"), "id")
+        application_id = _get(message, "application_id")
+        bot_user_id = _get(self.user, "id")
+        bot_application_id = getattr(self, "application_id", None)
+        is_bot_author = bool(_get(_get(message, "author"), "bot", False))
+        own_bot = is_bot_author and bot_user_id is not None and author_id == int(bot_user_id)
+        own_application = (
+            is_bot_author
+            and bot_application_id is not None
+            and application_id == int(bot_application_id)
+        )
+        if not own_bot and not own_application:
+            return False
         target = f"match:{int(match_id)}:join"
         for row in getattr(message, "components", ()) or ():
             children = getattr(row, "children", None)
             for component in children if children is not None else (row,):
                 if getattr(component, "custom_id", None) == target:
                     return True
-        content = str(getattr(message, "content", "") or "")
-        return f"match:{int(match_id)}" in content
+        return False
 
     async def _find_existing_panel(self, channel: Any, match_id: int) -> Any | None:
         history = getattr(channel, "history", None)
@@ -321,6 +333,52 @@ class InhouseBot(commands.Bot):
                 await cleanup_match_voice_channels(self.service, guild, match)
             except Exception:
                 logger.exception("내전 보이스 정리 처리 실패", extra={"match_id": _get(match, "id")})
+
+    async def _retry_match_voice_channels(self) -> None:
+        if self.service is None:
+            return
+        pending = getattr(self.service, "voice_retry_ids", None)
+        clear = getattr(self.service, "clear_voice_retry", None)
+        if not callable(pending) or not callable(clear):
+            return
+        for match_id in pending():
+            try:
+                match = await self.service.get_match(match_id)
+                if match is None or str(_get(match, "status", "")) != "PLAYING":
+                    clear(match_id)
+                    continue
+                guild = self.get_guild(int(_get(match, "guild_id")))
+                if guild is None:
+                    continue
+                summary = await ensure_match_voice_channels(
+                    self.service,
+                    guild,
+                    match,
+                    self.settings.team_a_voice_channel_id,
+                    self.settings.team_b_voice_channel_id,
+                )
+                if summary.error:
+                    logger.warning(
+                        "진행 중 내전 보이스 복구 재시도 실패: %s",
+                        summary.error,
+                        extra={"match_id": match_id},
+                    )
+                else:
+                    clear(match_id)
+                    await self._refresh_match(match)
+            except Exception:
+                logger.exception("진행 중 내전 보이스 복구 재시도 오류", extra={"match_id": match_id})
+
+    def _set_voice_retry(self, match_id: int, *, pending: bool) -> None:
+        if self.service is None:
+            return
+        update = getattr(
+            self.service,
+            "retry_voice_for" if pending else "clear_voice_retry",
+            None,
+        )
+        if callable(update):
+            update(match_id)
 
     async def _channel_for(self, channel_id: int) -> Any | None:
         channel = self.get_channel(int(channel_id))
@@ -474,15 +532,25 @@ class InhouseBot(commands.Bot):
                     status = str(_get(match, "status", ""))
                     if status == "PLAYING":
                         guild = self.get_guild(int(_get(match, "guild_id")))
-                        if guild is not None:
-                            summary = await ensure_match_voice_channels(
-                                self.service,
-                                guild,
-                                match,
-                                self.settings.team_a_voice_channel_id,
-                                self.settings.team_b_voice_channel_id,
-                            )
-                            if summary.error:
+                        if guild is None:
+                            self._set_voice_retry(match_id, pending=True)
+                        else:
+                            try:
+                                summary = await ensure_match_voice_channels(
+                                    self.service,
+                                    guild,
+                                    match,
+                                    self.settings.team_a_voice_channel_id,
+                                    self.settings.team_b_voice_channel_id,
+                                )
+                            except Exception:
+                                self._set_voice_retry(match_id, pending=True)
+                                logger.exception(
+                                    "진행 중 내전 보이스 복구 오류", extra={"match_id": match_id}
+                                )
+                                summary = None
+                            if summary is not None and summary.error:
+                                self._set_voice_retry(match_id, pending=True)
                                 logger.error(
                                     "진행 중 내전 보이스 복구 실패: %s",
                                     summary.error,
@@ -490,11 +558,19 @@ class InhouseBot(commands.Bot):
                                 )
                                 text_channel = await self._channel_for(int(_get(match, "channel_id")))
                                 if text_channel is not None:
-                                    await _safe_send(
-                                        text_channel,
-                                        f"<@{int(_get(match, 'creator_id'))}> 보이스 복구 실패: "
-                                        f"{summary.error} 경기와 팀 배정은 DB에 저장되어 있습니다.",
-                                    )
+                                    try:
+                                        await _safe_send(
+                                            text_channel,
+                                            f"<@{int(_get(match, 'creator_id'))}> 보이스 복구 실패: "
+                                            f"{summary.error} 경기와 팀 배정은 DB에 저장되어 있습니다.",
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "보이스 복구 실패 알림 전송 오류",
+                                            extra={"match_id": match_id},
+                                        )
+                            elif summary is not None:
+                                self._set_voice_retry(match_id, pending=False)
                             match = await self.service.get_match(match_id) or match
                     # Panel IDs can be NULL after a crash, or can point to a
                     # deleted Discord message.  Re-adopt/repost the panel while
