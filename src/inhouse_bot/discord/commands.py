@@ -159,6 +159,7 @@ class MatchCommandGroup(app_commands.Group):
             name="2. 모집과 준비 확인",
             value=(
                 "다른 사용자는 카드의 **참가**에서 지망을 선택하고, 취소하려면 **나가기**를 누릅니다.\n"
+                "정원이 차면 대기열에 들어가며 카드에는 앞 25명과 생략 인원이 표시됩니다.\n"
                 "정원이 차면 생성자 또는 관리자가 **준비 확인 시작**, 참가자는 **준비**를 누릅니다.\n"
                 "`/내전 라인변경 1지망 2지망 [3지망]` · 모집/준비 확인 중 지망 변경\n"
                 "카드에 표시된 모집·준비 마감 이후에는 참가·변경·준비·시작할 수 없습니다."
@@ -186,7 +187,7 @@ class MatchCommandGroup(app_commands.Group):
         embed.add_field(
             name="5. 관리자 명령",
             value=(
-                "`/내전 시즌시작 이름 [게임]` · `/내전 시즌종료 [게임]`\n"
+                "`/내전 시즌시작 이름 [게임]`(이름 1~100자) · `/내전 시즌종료 [게임]`\n"
                 "`/내전 mmr설정 사용자 라인 [티어] [점수] [게임]`\n"
                 "`/내전 관리자추가 사용자` · `/내전 관리자삭제 사용자` · "
                 "`/내전 관리자목록`"
@@ -194,7 +195,7 @@ class MatchCommandGroup(app_commands.Group):
             inline=False,
         )
         embed.set_footer(
-            text="삭제되거나 누락된 내전 패널과 실패한 모집 알림은 봇이 다시 복구·시도합니다."
+            text="누락된 패널, 모집 알림, 진행 중 보이스 준비 실패는 봇이 다시 복구·시도합니다."
         )
         await self._send_embed(interaction, embed)
 
@@ -204,6 +205,16 @@ class MatchCommandGroup(app_commands.Group):
             title=f"내전 봇 패치 내역 · v{__version__}",
             description="최신 버전부터 주요 변경 사항을 안내합니다.",
             colour=0x57F287,
+        )
+        embed.add_field(
+            name="v1.0.3 · 2026-08-31",
+            value=(
+                "• 진행 중 보이스 준비 실패 자동 재시도\n"
+                "• 시즌 이름 100자 제한과 역할 지망 DB 제약 추가\n"
+                "• 대기열 25명 표시 및 환경 변수 검증 강화\n"
+                "• 패널 복구 오인과 완료 후 보이스 정리 오류 처리 수정"
+            ),
+            inline=False,
         )
         embed.add_field(
             name="v1.0.2 · 2026-08-31",

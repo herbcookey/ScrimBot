@@ -241,7 +241,9 @@ async def test_usage_command_sends_ephemeral_command_guide():
     assert "모집/준비 확인 중" in guide
     assert "모집·준비 마감 이후" in guide
     assert "지명 마감까지 선택하지 않으면 내전이 자동 취소" in guide
-    assert "패널과 실패한 모집 알림" in embed.footer.text
+    assert "앞 25명과 생략 인원" in guide
+    assert "이름 1~100자" in guide
+    assert "진행 중 보이스 준비 실패" in embed.footer.text
     assert all(len(field.value) <= 1024 for field in embed.fields)
     assert len(embed) <= 6000
 
@@ -260,15 +262,17 @@ async def test_patch_notes_command_sends_ephemeral_version_history():
     kwargs = interaction.followup.send.await_args.kwargs
     assert kwargs["ephemeral"] is True
     embed = kwargs["embed"]
-    assert __version__ == "1.0.2"
-    assert embed.title == "내전 봇 패치 내역 · v1.0.2"
+    assert __version__ == "1.0.3"
+    assert embed.title == "내전 봇 패치 내역 · v1.0.3"
     history = "\n".join(f"{field.name}\n{field.value}" for field in embed.fields)
+    assert "v1.0.3" in history
     assert "v1.0.2" in history
     assert "v1.0.1" in history
     assert "v1.0.0" in history
     assert "정식 릴리즈" in history
     assert "패널 자동 복구" in history
     assert "시간 타입 오류 수정" in history
+    assert "보이스 준비 실패 자동 재시도" in history
 
 
 def _command_interaction(*, channel_type=None, manage_guild=False, guild=True):

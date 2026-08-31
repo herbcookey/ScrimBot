@@ -2,7 +2,7 @@
 
 Discord에서 게임 내전을 모집하고 팀을 배정하는 봇입니다. 기본 게임은 LoL 5:5입니다. 모집 상태와 참가자·팀·결과는 Supabase PostgreSQL에 저장하고, Discord 메시지는 그 상태를 보여 주는 UI로만 사용합니다.
 
-현재 버전은 **1.0.2**입니다. 버전별 변경 사항은 [내전봇 패치 내역](CHANGELOG.md)에서 확인할 수 있습니다.
+현재 버전은 **1.0.3**입니다. 버전별 변경 사항은 [내전봇 패치 내역](CHANGELOG.md)에서 확인할 수 있습니다.
 
 ## 요구 사항
 
@@ -32,7 +32,7 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 - `/내전 결과 승리팀 [메모]`: 진행 중인 내전 결과를 기록합니다.
 - `/내전 강퇴 사용자:@사용자`: 현재 채널의 모집 중 내전에서 참가자 또는 대기자를 강퇴합니다.
 - `/내전 전적 [사용자:@사용자] [게임] [시즌]`: 현재 서버의 종료 경기 전적과 승률을 조회합니다.
-- `/내전 시즌시작 이름 [게임]`: 봇 소유자 또는 해당 서버의 DB 관리자만 새 시즌을 시작합니다. 기존 활성 시즌은 같이 종료됩니다. Discord `Manage Guild`만으로는 실행할 수 없습니다.
+- `/내전 시즌시작 이름 [게임]`: 봇 소유자 또는 해당 서버의 DB 관리자만 1~100자의 이름으로 새 시즌을 시작합니다. 기존 활성 시즌은 같이 종료됩니다. Discord `Manage Guild`만으로는 실행할 수 없습니다.
 - `/내전 시즌종료 [게임]`: 현재 활성 시즌을 종료합니다.
 - `/내전 라인변경 1지망 2지망 [3지망]`: 모집 또는 준비 확인 중 지망을 바꿉니다.
 - `/내전 지명 사용자:@사용자`: Draft 현재 차례의 주장이 사용합니다.
@@ -48,17 +48,17 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 
 | 변수 | 설명 |
 | --- | --- |
-| `DISCORD_TOKEN` | Discord Bot 토큰. 저장소·로그·README에 남기지 않습니다. |
-| `DISCORD_GUILD_ID` | 슬래시 명령을 동기화할 Discord 서버 ID(정수). |
+| `DISCORD_TOKEN` | Discord Bot 토큰. 필수이며 공백 값은 거부합니다. 저장소·로그·README에 남기지 않습니다. |
+| `DISCORD_GUILD_ID` | 슬래시 명령을 동기화할 Discord 서버 ID(양의 정수). |
 | `BOT_OWNER_ID` | 봇 소유자의 Discord 사용자 ID(양의 정수). 관리자 추가·삭제와 전역 관리자 확인에 사용합니다. |
-| `DATABASE_URL` | 앱이 사용할 PostgreSQL 연결 문자열. |
-| `TEST_DATABASE_URL` | PostgreSQL 통합 테스트 전용 연결 문자열. 앱 실행에는 쓰지 않습니다. |
+| `DATABASE_URL` | 앱이 사용할 PostgreSQL 연결 문자열. 필수이며 공백 값은 거부합니다. |
+| `TEST_DATABASE_URL` | PostgreSQL 통합 테스트 전용 연결 문자열. 앱 실행에는 쓰지 않으며 DB sentinel 설정도 필요합니다. |
 | `READY_TIMEOUT_SECONDS` | 준비 확인 제한 시간(초). 기본값 `120`. |
 | `DRAFT_TIMEOUT_SECONDS` | Draft에서 각 지명을 기다리는 제한 시간(초). 기본값 `120`. |
 | `DEFAULT_RECRUITMENT_MINUTES` | `/내전 생성` 모집시간 기본값(분, 5~1440). 기본값 `30`. |
 | `REMINDER_BEFORE_SECONDS` | 모집 마감 전 채널 알림 시점(초). 기본값 `300`(5분). |
-| `TEAM_A_VOICE_CHANNEL_ID` | 기존 A팀 음성 채널 ID. B와 함께 설정할 때만 자동 배치 활성화. 기본값 빈 값(비활성). |
-| `TEAM_B_VOICE_CHANNEL_ID` | 기존 B팀 음성 채널 ID. A와 함께 설정할 때만 자동 배치 활성화. 기본값 빈 값(비활성). |
+| `TEAM_A_VOICE_CHANNEL_ID` | 기존 A팀 음성 채널 ID. B와 둘 다 설정하거나 둘 다 생략해야 합니다. 한쪽만 설정하면 시작하지 않습니다. |
+| `TEAM_B_VOICE_CHANNEL_ID` | 기존 B팀 음성 채널 ID. A와 둘 다 설정하거나 둘 다 생략해야 합니다. 한쪽만 설정하면 시작하지 않습니다. |
 | `INHOUSE_VOICE_CATEGORY_ID` | 내전 전용 보이스 채널을 만들 Discord 카테고리 ID. 설정하면 고정 A/B 채널보다 우선합니다. |
 | `VOICE_CLEANUP_DELAY_SECONDS` | 종료 후 동적 보이스 채널 삭제 대기 시간. 기본값 `600`, 최소 `0`. |
 
@@ -70,7 +70,7 @@ Developer Portal에서 애플리케이션에 Bot을 추가하고 다음 OAuth2 s
 
 - 기존 `팀 배정·시작` 버튼(현재 표시명 `준비 확인 시작`)은 생성자 또는 봇 관리자만 누를 수 있고, 참가자가 선택한 게임 정원과 정확히 같을 때 `READY_CHECK`를 시작합니다. 모든 준비 상태를 초기화하고 120초 제한을 저장합니다.
 - 준비 카드에는 준비 완료/전체 인원, 준비·미준비 명단, 남은 시간, `준비` 토글(다시 누르면 준비 취소), `내전 취소`를 표시합니다. 실제 참가자만 준비할 수 있으며 중복 클릭은 한 번만 반영됩니다. 전원이 준비하면 한 트랜잭션에서 무작위 A/B 팀을 저장하고 `PLAYING`으로 전환한 뒤 카드와 음성 배치를 갱신합니다.
-- 정원이 찬 상태에서 `참가`를 누르면 대기열에 등록됩니다. 참가자와 대기자는 중복될 수 없고, 등록 시각 FIFO 순서를 유지합니다. `나가기`는 둘 다 취소할 수 있으며, 참가자가 나가거나 강퇴되면 같은 트랜잭션에서 첫 대기자를 승격합니다. `READY_CHECK` 명단이 바뀌면 준비를 초기화하고, 정원이 다시 차면 새 제한 시간으로 준비 확인을 재시작합니다. `PLAYING` 중 이탈·강퇴·팀 재배정은 하지 않습니다.
+- 정원이 찬 상태에서 `참가`를 누르면 대기열에 등록됩니다. 참가자와 대기자는 중복될 수 없고, 등록 시각 FIFO 순서를 유지합니다. 카드에는 앞 25명과 `외 N명`을 표시합니다. `나가기`는 둘 다 취소할 수 있으며, 참가자가 나가거나 강퇴되면 같은 트랜잭션에서 첫 대기자를 승격합니다. `READY_CHECK` 명단이 바뀌면 준비를 초기화하고, 정원이 다시 차면 새 제한 시간으로 준비 확인을 재시작합니다. `PLAYING` 중 이탈·강퇴·팀 재배정은 하지 않습니다.
 - `/내전 강퇴 사용자:@사용자`는 현재 채널의 활성 내전에서 생성자 또는 봇 관리자만 사용할 수 있고, `RECRUITING`·`READY_CHECK`에서 참가자와 대기자를 모두 대상으로 합니다. 자기 자신 강퇴도 같은 규칙을 따르며, 대상이 아니면 ephemeral 오류를 반환합니다.
 - `/내전 전적 [사용자:@사용자]`는 생략 시 실행자 기준으로 현재 서버의 `FINISHED` 경기만 SQL 집계합니다. 총 경기·승·패·승률을 표시하고, `CANCELLED` 경기와 다른 서버의 경기는 제외하며 0경기 승률은 0%입니다.
 
@@ -123,7 +123,7 @@ LoL은 탑, 정글, 미드, 원딜, 서폿 점수를 따로 씁니다. 라인 ro
 
 예약 작업은 별도 큐 없이 단일 background task가 약 10~15초마다 한 번 폴링합니다. `process_due_matches(now)`처럼 현재 시각을 받는 함수로 모집 알림·모집 만료·준비 만료·Draft 만료를 처리하며, 실행 전 DB 상태와 기한을 재검사하고 여러 번 실행해도 중복 전이가 없도록 멱등 처리합니다. DB 트랜잭션을 Discord API 호출보다 먼저 커밋하므로 API 실패가 상태 변경을 되돌리지 않습니다.
 
-재시작 시 `RECRUITING`, `READY_CHECK`, `DRAFTING`, `PLAYING`을 조회해 Persistent View와 최신 카드를 다시 등록하고, 삭제됐거나 ID가 누락된 활성 내전 패널은 기존 패널을 찾아 연결하거나 새로 게시합니다. 이미 지난 마감은 즉시 처리하고, 전송에 실패한 모집 알림과 남은 마감은 폴링이 이어서 처리합니다. `PLAYING`은 DB에 저장된 카테고리와 채널 ID를 다시 확인하고 빠진 채널만 복구합니다. 정리 시간이 지난 종료 경기 처리도 다시 시작합니다.
+재시작 시 `RECRUITING`, `READY_CHECK`, `DRAFTING`, `PLAYING`을 조회해 Persistent View와 최신 카드를 다시 등록하고, 삭제됐거나 ID가 누락된 활성 내전 패널은 봇/애플리케이션이 작성한 정확한 참가 버튼 ID로만 찾아 연결하거나 새로 게시합니다. 이미 지난 마감은 즉시 처리하고, 전송에 실패한 모집 알림과 남은 마감은 폴링이 이어서 처리합니다. `PLAYING`은 DB에 저장된 카테고리와 채널 ID를 다시 확인하고 빠진 채널만 복구합니다. 보이스 준비에 실패한 진행 중 내전은 주기 작업에서 다시 시도하고, 종료·취소된 경기는 재시도 대상에서 제거합니다. 정리 시간이 지난 종료 경기 처리도 다시 시작합니다.
 
 ## 보이스 채널 자동 생성과 배치
 
@@ -131,7 +131,7 @@ LoL은 탑, 정글, 미드, 원딜, 서폿 점수를 따로 씁니다. 라인 ro
 
 동적 채널 이름은 `{match.id}번째 내전 1팀`, `{match.id}번째 내전 2팀`으로 고정입니다. 예를 들면 `104번째 내전 1팀`입니다. 서로 다른 텍스트 채널에서는 내전을 여러 개 열 수 있고 각 경기의 DB 채널 ID만 사용합니다. 같은 사용자는 같은 서버의 활성 내전 하나에만 참가할 수 있습니다. 참가자와 대기열 둘 다 포함입니다.
 
-보이스 채널은 팀과 라인이 DB에서 확정되고 `PLAYING` 커밋이 끝난 다음 만듭니다. 팀 사용자별 overwrite를 넣고 현재 음성에 접속한 사람만 옮깁니다. 미접속은 실패가 아닙니다. 한 명 이동이 실패해도 나머지는 계속 처리합니다. Discord 실패로 경기 시작이나 결과가 롤백되지는 않습니다.
+보이스 채널은 팀과 라인이 DB에서 확정되고 `PLAYING` 커밋이 끝난 다음 만듭니다. 팀 사용자별 overwrite를 넣고 현재 음성에 접속한 사람만 옮깁니다. 미접속은 실패가 아닙니다. 한 명 이동이 실패해도 나머지는 계속 처리합니다. 채널 준비 실패는 주기 작업에서 재시도하며 Discord 실패로 경기 시작이나 결과가 롤백되지는 않습니다.
 
 봇 권한은 `Manage Channels`, `Move Members`, `View Channel`, `Connect`가 필요합니다. 사용자별 permission overwrite도 설정할 수 있어야 합니다. `Administrator`는 필요 없습니다. Gateway intent는 기존 `voice_states`만 쓰며 `GUILD_MEMBERS`, `MESSAGE_CONTENT`는 추가하지 않습니다.
 
@@ -185,12 +185,15 @@ python -m inhouse_bot.main
 supabase init                 # supabase/config.toml이 아직 없을 때만
 supabase login
 supabase link --project-ref <PROJECT_REF>
+supabase migration list      # 로컬·원격 migration 이력 확인
 supabase db push
 ```
 
-`supabase db push`는 연결한 원격 프로젝트에 아직 적용되지 않은 migration을 적용합니다. 이미 데이터가 있는 프로젝트에서는 먼저 백업과 대상 project-ref를 확인하세요. CLI를 사용할 수 없을 때만 대시보드 SQL Editor에서 migration 파일을 순서대로 검토해 수동 실행하고, migration 이력을 정리하기 전에는 `db push`와 섞어 쓰지 않습니다.
+`supabase db push`는 연결한 원격 프로젝트에 아직 적용되지 않은 migration을 적용합니다. 이미 데이터가 있는 프로젝트에서는 먼저 백업, 대상 project-ref, `supabase migration list`의 로컬·원격 이력을 확인하세요. 이력이 다르면 원인을 확인해 정리하기 전에는 push하지 않습니다. CLI를 사용할 수 없을 때만 대시보드 SQL Editor에서 migration 파일을 순서대로 검토해 수동 실행하고, migration 이력을 정리하기 전에는 `db push`와 섞어 쓰지 않습니다.
 
-1차부터 3A까지는 `20260826012146_schema.sql`, 3B는 `20260826025650_phase_3b_role_mmr.sql`, 동적 보이스는 `20260826034441_phase_3b_dynamic_voice_channels.sql`, 빈 보이스 종료 상태는 `20260826060624_phase_3b_empty_voice_channels.sql`, 봇 관리자 테이블은 `20260826063825_bot_admins.sql`입니다. 초기화한 DB에서는 프로젝트 루트에서 `supabase db push` 한 번이면 순서대로 들어갑니다. 3B는 LoL의 라인 기능만 켜고 기존 글로벌 점수를 다섯 라인에 복사하지 않습니다. 끝난 경기도 다시 계산 안 합니다. migration 전에 만들어진 경기는 경기별 라인 기능 값이 `false`라서 진행 중인 기존 경기도 3A 방식으로 마무리됩니다.
+1차부터 3A까지는 `20260826012146_schema.sql`, 3B는 `20260826025650_phase_3b_role_mmr.sql`, 동적 보이스는 `20260826034441_phase_3b_dynamic_voice_channels.sql`, 빈 보이스 종료 상태는 `20260826060624_phase_3b_empty_voice_channels.sql`, 봇 관리자 테이블은 `20260826063825_bot_admins.sql`입니다. 이후 MMR·경기 무결성은 `20260830204943_mmr_bounds_and_match_invariants.sql`, 패널·모집 알림 복구 상태는 `20260830205929_match_recovery_delivery.sql`, 시즌명·역할 지망 제약과 참가자 조회 인덱스는 `20260831013642_enforce_season_and_role_preferences.sql`에 있습니다. 초기화한 DB에서는 프로젝트 루트에서 `supabase db push` 한 번이면 순서대로 들어갑니다. 3B는 LoL의 라인 기능만 켜고 기존 글로벌 점수를 다섯 라인에 복사하지 않습니다. 끝난 경기도 다시 계산 안 합니다. migration 전에 만들어진 경기는 경기별 라인 기능 값이 `false`라서 진행 중인 기존 경기도 3A 방식으로 마무리됩니다.
+
+마지막 migration은 기존 시즌 이름이 100자를 넘거나 역할 지망 조합이 잘못된 행이 있으면 해당 ID를 출력하고 전체 적용을 중단합니다. 오류에 나온 데이터를 백업·정리한 뒤 다시 적용하세요.
 
 롤백할 때 migration 파일만 지우면 안 됩니다. 3A 이후 기록된 `player_ratings`, `rating_history`, `matches.season_id`가 있어서 컬럼이나 테이블부터 내리면 점수 이력과 시즌 연결이 없어집니다. 먼저 백업하고 봇을 중지한 다음, 어떤 데이터를 보존할지 정해서 별도 하향 migration을 작성해야 합니다.
 
@@ -204,14 +207,14 @@ supabase db push
 ## 데이터 일관성과 복구
 
 - `matches`, `match_participants`, `match_results`가 source of truth입니다. Discord 임베드·버튼·메시지 ID는 캐시된 표시 계층이며, 재시작·중복 interaction 때 DB를 다시 읽어야 합니다.
-- Discord 메시지가 삭제되거나 오래된 경우 메시지 내용을 수동으로 진실로 취급하지 말고 DB 행을 확인한 뒤 패널을 다시 게시·갱신합니다. migration은 스키마만 바꾸며 참가자/결과를 복구하지 않습니다.
+- Discord 메시지가 삭제되거나 오래된 경우 메시지 내용을 진실로 취급하지 말고 DB 행을 확인한 뒤 패널을 다시 게시·갱신합니다. 자동 복구도 봇/애플리케이션이 작성한 정확한 버튼 ID만 패널로 인정합니다. migration은 스키마만 바꾸며 참가자/결과를 복구하지 않습니다.
 - 운영 DB에 migration 또는 수동 SQL을 실행하기 전 Supabase 백업/`pg_dump`를 확보합니다. 장애 시 봇을 중지하고 백업과 DB 상태를 확인한 다음 필요한 행을 복구하고 재시작합니다.
 - `RECRUITING` 중에는 생성자도 `나가기`를 누를 수 있습니다. 이때 참가자 행만 나가고 `matches.creator_id`는 유지하므로 생성자의 관리 권한(시작·취소·결과 기록)은 사라지지 않습니다. `PLAYING`에서는 나갈 수 없습니다.
 - 이 봇은 단일 프로세스 폴링 작업이며 분산 작업 큐를 사용하지 않습니다. 모집 알림은 DB claim·성공 확인·재시도로 유실을 줄이고, 활성 패널은 재시작과 주기 복구에서 다시 연결하거나 게시합니다. Discord가 알림을 받은 직후 성공 확인 전에 프로세스가 종료되면 같은 알림이 다시 전송될 수 있습니다. DB 상태는 Discord 메시지 편집·음성 이동 실패로 롤백되지 않으며 API 실패는 로그와 복구 작업으로 대응합니다.
 
 ## 테스트
 
-개발 의존성을 설치한 가상 환경에서 실행합니다. Discord 쪽은 오프라인 테스트이고, `tests/test_matches.py`, `tests/test_role_matches.py`, `tests/test_dynamic_voice_matches.py`, `tests/test_admin.py`의 DB 관련 테스트는 실제 PostgreSQL 통합 테스트입니다.
+개발 의존성을 설치한 가상 환경에서 실행합니다. Discord 쪽은 오프라인 테스트이고, `tests/test_matches.py`, `tests/test_role_matches.py`, `tests/test_dynamic_voice_matches.py`, `tests/test_admin.py`, `tests/test_database_constraints.py`의 DB 관련 테스트는 실제 PostgreSQL 통합 테스트입니다.
 
 ```powershell
 # TEST_DATABASE_URL이 없으면 통합 테스트 모듈은 안전하게 skip됩니다.
@@ -220,9 +223,15 @@ python -m pytest
 
 실제 통합 테스트는 별도 PostgreSQL DB를 만들고 아래 sentinel을 한 번 설정한 뒤 다시 연결해 실행합니다. fixture는 sentinel이 정확히 `true`인 DB에만 migration과 cleanup을 실행합니다. 시간 만료 테스트는 고정된 `now`를 `process_due_matches(now)`에 전달하며 실제 `sleep`/대기를 사용하지 않습니다.
 
+테스트 DB 관리자 연결에서 다음 SQL을 한 번 실행한 뒤 연결을 끊습니다.
+
+```sql
+ALTER DATABASE "<test-db>" SET inhouse_bot.test_database = 'true';
+```
+
+그다음 PowerShell에서 연결 문자열을 설정해 실행합니다.
+
 ```powershell
-# 테스트 DB 관리자 연결에서 한 번 실행한 뒤 연결을 끊습니다.
-ALTER DATABASE <test-db> SET inhouse_bot.test_database = 'true';
 $env:TEST_DATABASE_URL = "postgresql://<test-user>:<password>@<host>:5432/<test-db>"
 python -m pytest tests/test_matches.py
 ```
