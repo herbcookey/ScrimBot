@@ -148,9 +148,10 @@ class MatchCommandGroup(app_commands.Group):
             name="1. MMR 등록과 내전 생성",
             value=(
                 "`/내전 등록 라인 티어 [게임]` · 사용할 라인 MMR 최초 등록\n"
-                "`/내전 생성 제목 1지망 2지망 [모집시간] [게임] [방식] [3지망]`\n"
-                "생성자는 자동으로 참가하며 1·2지망을 반드시 선택해야 합니다. "
-                "라인 MMR 내전은 선택할 모든 지망을 `/내전 등록`으로 먼저 등록해야 합니다.\n"
+                "`/내전 생성 제목 1지망 [2지망] [3지망] [모집시간] [게임] [방식]`\n"
+                "생성자는 자동으로 참가하며 1지망은 필수, 2·3지망은 선택입니다. "
+                "3지망을 쓰려면 2지망도 입력해야 하고, 제출한 지망은 서로 달라야 합니다. "
+                "라인 MMR 내전은 제출한 모든 지망을 `/내전 등록`으로 먼저 등록해야 합니다.\n"
                 "**Balanced**는 준비 완료 후 자동 배정하고, **Draft**는 주장들이 차례로 지명합니다."
             ),
             inline=False,
@@ -161,7 +162,7 @@ class MatchCommandGroup(app_commands.Group):
                 "다른 사용자는 카드의 **참가**에서 지망을 선택하고, 취소하려면 **나가기**를 누릅니다.\n"
                 "정원이 차면 대기열에 들어가며 카드에는 앞 25명과 생략 인원이 표시됩니다.\n"
                 "정원이 차면 생성자 또는 관리자가 **준비 확인 시작**, 참가자는 **준비**를 누릅니다.\n"
-                "`/내전 라인변경 1지망 2지망 [3지망]` · 모집/준비 확인 중 지망 변경\n"
+                "`/내전 라인변경 1지망 [2지망] [3지망]` · 모집/준비 확인 중 지망 변경\n"
                 "카드에 표시된 모집·준비 마감 이후에는 참가·변경·준비·시작할 수 없습니다."
             ),
             inline=False,
@@ -205,6 +206,16 @@ class MatchCommandGroup(app_commands.Group):
             title=f"내전 봇 패치 내역 · v{__version__}",
             description="최신 버전부터 주요 변경 사항을 안내합니다.",
             colour=0x57F287,
+        )
+        embed.add_field(
+            name="v1.0.4 · 2026-09-02",
+            value=(
+                "• 생성·참가·라인 변경에서 1지망만 필수로 입력하도록 변경\n"
+                "• 2·3지망은 선택이며 3지망은 2지망 입력 시에만 사용할 수 있도록 검증\n"
+                "• 제출한 지망 중 중복을 거부하고 등록된 모든 라인만 배정에 사용\n"
+                "• 기존 all-null/2·3지망 저장 행을 보존하는 DB 제약 migration 추가"
+            ),
+            inline=False,
         )
         embed.add_field(
             name="v1.0.3 · 2026-08-31",
@@ -274,7 +285,7 @@ class MatchCommandGroup(app_commands.Group):
         interaction: discord.Interaction,
         title: app_commands.Range[str, 1, MATCH_TITLE_MAX_LENGTH],
         preferred_role_1: app_commands.Choice[str],
-        preferred_role_2: app_commands.Choice[str],
+        preferred_role_2: app_commands.Choice[str] | None = None,
         recruitment_minutes: app_commands.Range[int, 5, 1440] | None = None,
         game: str | None = None,
         assignment_mode: app_commands.Choice[str] | None = None,
@@ -289,6 +300,11 @@ class MatchCommandGroup(app_commands.Group):
             return
         if len(title) > MATCH_TITLE_MAX_LENGTH:
             await self._send(interaction, f"제목은 {MATCH_TITLE_MAX_LENGTH}자 이내로 입력해 주세요.")
+            return
+        preferred_role_2_value = _choice_value(preferred_role_2)
+        preferred_role_3_value = _choice_value(preferred_role_3)
+        if preferred_role_3_value is not None and preferred_role_2_value is None:
+            await self._send(interaction, "3지망을 입력하려면 2지망도 입력해야 합니다.")
             return
         await self._defer(interaction)
         try:
@@ -318,8 +334,8 @@ class MatchCommandGroup(app_commands.Group):
                 game_key=game or "lol",
                 assignment_mode=_choice_value(assignment_mode, "BALANCED"),
                 preferred_role_1=_choice_value(preferred_role_1),
-                preferred_role_2=_choice_value(preferred_role_2),
-                preferred_role_3=_choice_value(preferred_role_3),
+                preferred_role_2=preferred_role_2_value,
+                preferred_role_3=preferred_role_3_value,
                 voice_category_id=voice_category_id,
                 **({} if recruitment_minutes is None else {"recruitment_minutes": int(recruitment_minutes)}),
             )
@@ -662,11 +678,16 @@ class MatchCommandGroup(app_commands.Group):
         self,
         interaction: discord.Interaction,
         first: app_commands.Choice[str],
-        second: app_commands.Choice[str],
+        second: app_commands.Choice[str] | None = None,
         third: app_commands.Choice[str] | None = None,
     ) -> None:
         if interaction.guild is None or interaction.channel is None:
             await self._send(interaction, "서버 채널에서만 사용할 수 있습니다.")
+            return
+        second_value = _choice_value(second)
+        third_value = _choice_value(third)
+        if third_value is not None and second_value is None:
+            await self._send(interaction, "3지망을 입력하려면 2지망도 입력해야 합니다.")
             return
         await self._defer(interaction)
         try:
@@ -679,7 +700,7 @@ class MatchCommandGroup(app_commands.Group):
             match_id = int(_get(active, "id"))
             await self.service.update_preferences(
                 match_id, int(interaction.user.id),
-                _choice_value(first), _choice_value(second), _choice_value(third),
+                _choice_value(first), second_value, third_value,
             )
             await self._refresh_message(interaction, match_id)
             await self._send(interaction, "지망 라인을 변경했습니다.")

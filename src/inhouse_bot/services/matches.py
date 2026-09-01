@@ -211,7 +211,7 @@ class MatchService:
         match_id: int,
         user_id: int,
         preferred_role_1: str,
-        preferred_role_2: str,
+        preferred_role_2: str | None = None,
         preferred_role_3: str | None = None,
         *,
         now: datetime | None = None,

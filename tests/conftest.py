@@ -130,6 +130,17 @@ async def _migration_applied(conn, migration_name: str) -> bool:
                    ) IS NOT NULL
             """
         ))
+    if migration_name.startswith("20260901154522"):
+        return bool(await conn.fetchval(
+            """
+            SELECT EXISTS (
+                       SELECT 1 FROM pg_constraint
+                       WHERE conrelid = 'public.match_participants'::regclass
+                         AND conname = 'match_participants_preferences_check'
+                         AND pg_get_constraintdef(oid) LIKE '%IS TRUE%'
+                   )
+            """
+        ))
     return False
 
 

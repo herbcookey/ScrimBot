@@ -258,7 +258,7 @@ class Participant:
                 self.preferred_role_1,
                 self.preferred_role_2,
                 self.preferred_role_3,
-            ) if role is not None
+            ) if role is not None and str(role).strip()
         )
 
     @property
@@ -903,10 +903,19 @@ class MatchRepository:
         second: str | None,
         third: str | None,
     ) -> tuple[str | None, str | None, str | None]:
+        # Discord/modals may submit empty strings for optional slots. Normalize
+        # those before checking the legacy all-null branch so non-role matches
+        # continue to accept rows with no role preferences.
+        first = str(first).strip() if first is not None else None
+        second = str(second).strip() if second is not None else None
+        third = str(third).strip() if third is not None else None
+        first = first or None
+        second = second or None
+        third = third or None
         if not enabled and first is None and second is None and third is None:
             return None, None, None
         try:
-            preferences = validate_preferences(first or "", second or "", third)
+            preferences = validate_preferences(first, second, third)
         except RoleAssignmentError as exc:
             raise InvalidRolePreferencesError(str(exc)) from exc
         if enabled:
@@ -926,8 +935,9 @@ class MatchRepository:
                     + ", ".join(ROLE_LABELS[role] for role in missing)
                 )
         return (
-            preferences[0], preferences[1],
-            preferences[2] if len(preferences) == 3 else None,
+            preferences[0],
+            preferences[1] if len(preferences) >= 2 else None,
+            preferences[2] if len(preferences) >= 3 else None,
         )
 
     @staticmethod
@@ -961,10 +971,10 @@ class MatchRepository:
                     _row_value(participant, "preferred_role_1"),
                     _row_value(participant, "preferred_role_2"),
                     _row_value(participant, "preferred_role_3"),
-                ) if role is not None
+                ) if role is not None and str(role).strip()
             )
-            if len(preferences) < 2:
-                raise InvalidRolePreferencesError(f"<@{user_id}>님의 라인 지망이 없습니다.")
+            if not preferences:
+                raise InvalidRolePreferencesError(f"<@{user_id}>님의 1지망 라인이 없습니다.")
             missing = [role for role in preferences if role not in by_user.get(user_id, {})]
             if missing:
                 raise UnplacedRoleError(
@@ -1391,7 +1401,7 @@ class MatchRepository:
         match_id: int,
         user_id: int,
         preferred_role_1: str,
-        preferred_role_2: str,
+        preferred_role_2: str | None = None,
         preferred_role_3: str | None = None,
         *,
         now: datetime | None = None,

@@ -82,6 +82,81 @@ def test_positive_average_and_preferences():
         validate_preferences("탑", "TOP")
 
 
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    (
+        (("TOP", None, None), ("TOP",)),
+        ((" TOP ", " ", None), ("TOP",)),
+        (("TOP", "JUNGLE", None), ("TOP", "JUNGLE")),
+        (("TOP", "JUNGLE", "MID"), ("TOP", "JUNGLE", "MID")),
+    ),
+)
+def test_optional_preferences_normalize_blanks_and_preserve_order(values, expected):
+    assert validate_preferences(*values) == expected
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        (None, None, None),
+        (" ", None, None),
+        ("TOP", None, "MID"),
+        ("TOP", "TOP", None),
+        ("TOP", "JUNGLE", "TOP"),
+        ("TOP", "JUNGLE", "JUNGLE"),
+    ),
+)
+def test_optional_preferences_reject_missing_first_dependency_and_duplicates(values):
+    with pytest.raises(RoleAssignmentError):
+        validate_preferences(*values)
+
+
+def _mixed_players() -> tuple[RolePlayer, ...]:
+    choices = (
+        ("TOP",), ("TOP", "JUNGLE"),
+        ("JUNGLE",), ("JUNGLE", "MID"),
+        ("MID",), ("MID", "ADC"),
+        ("ADC",), ("ADC", "SUPPORT"),
+        ("SUPPORT",), ("SUPPORT", "TOP", "MID"),
+    )
+    return tuple(
+        RolePlayer(
+            index + 1,
+            roles,
+            {role: 1500 for role in ROLES},
+        )
+        for index, roles in enumerate(choices)
+    )
+
+
+def test_balanced_and_draft_support_mixed_preference_counts():
+    players = _mixed_players()
+    balanced = balanced_assignment(players, 101)
+    for team in ("A", "B"):
+        assert {item.role for item in balanced if item.team == team} == set(ROLES)
+
+    teams = {
+        user_id: "A" if user_id % 2 else "B"
+        for user_id in range(1, 11)
+    }
+    assert draft_completion_possible(players, teams, 101)
+    drafted = finalize_draft(players, teams, 101)
+    for team in ("A", "B"):
+        assert {item.role for item in drafted if item.team == team} == set(ROLES)
+
+
+def test_assignment_fails_cleanly_for_zero_preferences():
+    players = _mixed_players()[:-1] + (
+        RolePlayer(10, (None,), {role: 1500 for role in ROLES}),
+    )
+    with pytest.raises(RoleAssignmentError, match="지망이 없는"):
+        balanced_assignment(players, 101)
+    teams = {index + 1: "A" if index < 5 else "B" for index in range(10)}
+    assert not draft_completion_possible(players, teams, 101)
+    with pytest.raises(RoleAssignmentError, match="지망이 없는"):
+        finalize_draft(players, teams, 101)
+
+
 def test_balanced_has_every_role_and_is_deterministic():
     first = balanced_assignment(_players(), 42)
     second = balanced_assignment(reversed(_players()), 42)

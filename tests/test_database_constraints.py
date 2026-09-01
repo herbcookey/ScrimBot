@@ -41,10 +41,21 @@ async def test_season_and_role_preference_constraints(db_pool):
                 INSERT INTO preference_constraint_test
                     (match_id, user_id, preferred_role_1, preferred_role_2, preferred_role_3)
                 VALUES (1, 3, 'TOP', 'JUNGLE', 'MID');
+
+                INSERT INTO preference_constraint_test
+                    (match_id, user_id, preferred_role_1)
+                VALUES (1, 4, 'TOP');
                 """
             )
 
-            for values in ((None, "TOP", None), ("TOP", "TOP", None)):
+            for values in (
+                (None, "TOP", None),
+                (None, None, "TOP"),
+                ("TOP", None, "JUNGLE"),
+                ("TOP", "TOP", None),
+                ("TOP", "JUNGLE", "TOP"),
+                ("TOP", "JUNGLE", "JUNGLE"),
+            ):
                 with pytest.raises(asyncpg.CheckViolationError):
                     async with conn.transaction():
                         await conn.execute(

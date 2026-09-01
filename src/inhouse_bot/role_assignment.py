@@ -85,15 +85,55 @@ def normalize_role(value: str) -> str:
     return role
 
 
-def validate_preferences(first: str, second: str, third: str | None = None) -> tuple[str, ...]:
-    if not first or not second:
-        raise RoleAssignmentError("1지망과 2지망 라인이 필요합니다.")
-    roles = tuple(normalize_role(value) for value in (first, second, third) if value)
-    if len(roles) < 2:
-        raise RoleAssignmentError("1지망과 2지망 라인이 필요합니다.")
+def _optional_role_input(value: str | None) -> str | None:
+    """빈 입력을 ``None``으로 통일한다.
+
+    Discord 모달과 저장소에서 오는 값은 빈 문자열 또는 공백 문자열일 수
+    있다. 선택 지망은 이런 값을 실제 지망으로 취급하지 않아야 하며, 1지망은
+    빈 값이면 별도의 필수 입력 오류를 내야 한다.
+    """
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def validate_preferences(
+    first: str | None,
+    second: str | None = None,
+    third: str | None = None,
+) -> tuple[str, ...]:
+    first = _optional_role_input(first)
+    second = _optional_role_input(second)
+    third = _optional_role_input(third)
+    if first is None:
+        raise RoleAssignmentError("1지망 라인은 반드시 입력해야 합니다.")
+    if third is not None and second is None:
+        raise RoleAssignmentError("3지망을 입력하려면 2지망 라인도 입력해야 합니다.")
+    roles = tuple(
+        normalize_role(value)
+        for value in (first, second, third)
+        if value is not None
+    )
     if len(set(roles)) != len(roles):
         raise RoleAssignmentError("지망 라인은 서로 달라야 합니다.")
     return roles
+
+
+def _supplied_preferences(player: RolePlayer) -> tuple[str, ...]:
+    """Return supplied preferences for defensive handling of legacy rows."""
+
+    return tuple(
+        role for role in player.preferences
+        if role is not None and str(role).strip()
+    )
+
+
+def _preference_cost(player: RolePlayer, role: str) -> int:
+    """Return the rank among supplied preferences, ignoring null placeholders."""
+
+    return _supplied_preferences(player).index(role)
 
 
 def initial_role_rating(tier: str, detail: str | int | None = None) -> int:
@@ -186,8 +226,11 @@ def _best_team_roles(
 ) -> tuple[RoleAssignment, ...] | None:
     if len(players) != 5:
         return None
+    preference_options = tuple(_supplied_preferences(player) for player in players)
+    if any(not preferences for preferences in preference_options):
+        return None
     best: tuple[tuple[object, ...], tuple[RoleAssignment, ...]] | None = None
-    for chosen_roles in product(*(player.preferences for player in players)):
+    for chosen_roles in product(*preference_options):
         if set(chosen_roles) != set(ROLES) or len(set(chosen_roles)) != 5:
             continue
         assignments = tuple(
@@ -196,7 +239,7 @@ def _best_team_roles(
                 team,
                 role,
                 player.rating_for(role),
-                player.preferences.index(role),
+                _preference_cost(player, role),
             )
             for player, role in zip(players, chosen_roles, strict=True)
         )
@@ -210,9 +253,17 @@ def _best_team_roles(
 
 
 def balanced_assignment(players: Iterable[RolePlayer], match_id: int) -> tuple[RoleAssignment, ...]:
-    roster = tuple(sorted(players, key=lambda player: (len(player.preferences), player.user_id)))
+    roster = tuple(sorted(players, key=lambda player: (len(_supplied_preferences(player)), player.user_id)))
     if len(roster) != 10:
         raise RoleAssignmentError("Balanced 배정은 참가자 10명이 필요합니다.")
+    preference_options = tuple(_supplied_preferences(player) for player in roster)
+    if any(not preferences for preferences in preference_options):
+        raise RoleAssignmentError("라인 지망이 없는 참가자가 있어 배정할 수 없습니다.")
+    if any(
+        any(role not in ROLES for role in preferences)
+        for preferences in preference_options
+    ):
+        raise RoleAssignmentError("지원하지 않는 라인 지망이 있어 배정할 수 없습니다.")
     best: tuple[tuple[object, ...], tuple[RoleAssignment, ...]] | None = None
     role_counts = {role: 0 for role in ROLES}
     chosen: dict[int, str] = {}
@@ -236,7 +287,7 @@ def balanced_assignment(players: Iterable[RolePlayer], match_id: int) -> tuple[R
                                 team,
                                 role,
                                 player.rating_for(role),
-                                player.preferences.index(role),
+                                _preference_cost(player, role),
                             )
                         )
                 total_a = sum(item.rating for item in assignments if item.team == "A")
@@ -260,7 +311,7 @@ def balanced_assignment(players: Iterable[RolePlayer], match_id: int) -> tuple[R
                     best = objective, result
             return
         player = roster[index]
-        for preference_cost, role in enumerate(player.preferences):
+        for preference_cost, role in enumerate(preference_options[index]):
             if role_counts[role] >= 2:
                 continue
             role_counts[role] += 1
@@ -293,6 +344,8 @@ def draft_completion_possible(
     players: Iterable[RolePlayer], teams: Mapping[int, str], match_id: int
 ) -> bool:
     roster = tuple(players)
+    if any(not _supplied_preferences(player) for player in roster):
+        return False
     team_a = {user_id for user_id, team in teams.items() if team == "A"}
     team_b = {user_id for user_id, team in teams.items() if team == "B"}
     if len(team_a) > 5 or len(team_b) > 5 or team_a & team_b:
@@ -315,6 +368,8 @@ def finalize_draft(
     players: Iterable[RolePlayer], teams: Mapping[int, str], match_id: int
 ) -> tuple[RoleAssignment, ...]:
     roster = tuple(players)
+    if any(not _supplied_preferences(player) for player in roster):
+        raise RoleAssignmentError("라인 지망이 없는 참가자가 있어 배정할 수 없습니다.")
     by_team = {
         team: tuple(sorted((player for player in roster if teams.get(player.user_id) == team), key=lambda item: item.user_id))
         for team in ("A", "B")

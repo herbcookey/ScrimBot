@@ -86,13 +86,16 @@ def _participant_line(item: Any, *, show_preferences: bool, show_role: bool) -> 
         if rating is not None:
             line += f" {int(rating)}점"
     elif show_preferences:
-        preferences = tuple(_get(item, "preferences", ()) or ())
+        preferences = tuple(
+            role for role in (_get(item, "preferences", ()) or ())
+            if role is not None and str(role).strip()
+        )
         if not preferences:
             preferences = tuple(
                 value for value in (
                     _get(item, "preferred_role_1"), _get(item, "preferred_role_2"),
                     _get(item, "preferred_role_3"),
-                ) if value
+                ) if value is not None and str(value).strip()
             )
         labels = "/".join(ROLE_LABELS.get(str(role), str(role)) for role in preferences)
         average = int(_get(item, "average_role_rating", 0) or 0)

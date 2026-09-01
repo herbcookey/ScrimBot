@@ -32,7 +32,7 @@ def _role_participant(user_id, *, team=None, role=None, rating=None, preferences
         assigned_role=role,
         role_rating_snapshot=rating,
         preferred_role_1=preferences[0],
-        preferred_role_2=preferences[1],
+        preferred_role_2=preferences[1] if len(preferences) > 1 else None,
         preferred_role_3=None,
         preferences=preferences,
         average_role_rating=1500,
@@ -147,6 +147,16 @@ def test_renderer_drafting_and_assigned_roles():
     assert fields["보이스"] == "보이스 채널 생성 실패"
 
 
+def test_renderer_displays_only_submitted_preferences():
+    participant = _role_participant(1, preferences=("TOP",))
+    fields = _fields(render_match(SimpleNamespace(
+        status="RECRUITING", title="단일 지망", capacity=10, creator_id=1,
+        role_rating_enabled=True, participants=(participant,), waitlist=(),
+    )))
+    assert "탑/-" not in fields["참가자 명단"]
+    assert "탑 · 1500점" in fields["참가자 명단"]
+
+
 @pytest.mark.asyncio
 async def test_role_join_button_opens_modal_before_defer():
     from inhouse_bot.discord.views import JoinPreferencesModal, MatchView
@@ -163,7 +173,51 @@ async def test_role_join_button_opens_modal_before_defer():
     modal = response.send_modal.await_args.args[0]
     assert isinstance(modal, JoinPreferencesModal)
     assert modal.custom_id == "match:42:join_roles"
-    assert modal.first.required and modal.second.required and not modal.third.required
+    assert modal.first.required and not modal.second.required and not modal.third.required
+
+
+@pytest.mark.asyncio
+async def test_join_modal_normalizes_optional_blank_slots():
+    from inhouse_bot.discord.views import JoinPreferencesModal, MatchView
+
+    result = SimpleNamespace(waitlisted=False)
+    service = SimpleNamespace(
+        get_match=AsyncMock(return_value=SimpleNamespace(role_rating_enabled=True, guild_id=123)),
+        join_match=AsyncMock(return_value=result),
+    )
+    view = MatchView(service, 42, status="RECRUITING", guild_id=123)
+    modal = JoinPreferencesModal(view, None)
+    modal.first._value = " TOP "
+    modal.second._value = " "
+    modal.third._value = ""
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+
+    await modal.on_submit(interaction)
+
+    service.join_match.assert_awaited_once_with(
+        42, 77, preferred_role_1="TOP", preferred_role_2=None, preferred_role_3=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_join_modal_rejects_third_without_second_before_service_call():
+    from inhouse_bot.discord.views import JoinPreferencesModal, MatchView
+
+    service = SimpleNamespace(
+        get_match=AsyncMock(return_value=SimpleNamespace(role_rating_enabled=True, guild_id=123)),
+        join_match=AsyncMock(),
+    )
+    view = MatchView(service, 42, status="RECRUITING", guild_id=123)
+    modal = JoinPreferencesModal(view, None)
+    modal.first._value = "TOP"
+    modal.second._value = ""
+    modal.third._value = "MID"
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+
+    await modal.on_submit(interaction)
+
+    service.join_match.assert_not_awaited()
+    assert "3지망" in interaction.followup.send.await_args.args[0]
 
 
 def test_create_command_recruitment_minutes_is_optional():
@@ -172,6 +226,121 @@ def test_create_command_recruitment_minutes_is_optional():
     parameter = MatchCommandGroup.create._params["recruitment_minutes"]
     assert parameter.required is False and parameter.default is None
     assert parameter.min_value == 5 and parameter.max_value == 1440
+
+
+@pytest.mark.asyncio
+async def test_create_command_rejects_third_without_second_before_service_call():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(create_match=AsyncMock())
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+
+    await MatchCommandGroup.create.callback(
+        group,
+        interaction,
+        "테스트",
+        discord.app_commands.Choice(name="탑", value="TOP"),
+        None,
+        None,
+        None,
+        None,
+        discord.app_commands.Choice(name="미드", value="MID"),
+    )
+
+    service.create_match.assert_not_awaited()
+    assert "3지망" in interaction.followup.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_create_command_passes_single_preference_with_optional_slots_none():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    created = SimpleNamespace(
+        id=42,
+        status="RECRUITING",
+        guild_id=123,
+        channel_id=456,
+        creator_id=77,
+        title="단일 지망",
+        capacity=10,
+        participants=(),
+        waitlist=(),
+        role_rating_enabled=True,
+    )
+    service = SimpleNamespace(
+        create_match=AsyncMock(return_value=created),
+        get_match=AsyncMock(return_value=created),
+        update_message_id=AsyncMock(),
+    )
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    interaction.channel.id = 456
+    interaction.channel.send = AsyncMock(return_value=SimpleNamespace(id=99))
+
+    await MatchCommandGroup.create.callback(
+        group,
+        interaction,
+        "단일 지망",
+        discord.app_commands.Choice(name="탑", value="TOP"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    kwargs = service.create_match.await_args.kwargs
+    assert kwargs["preferred_role_1"] == "TOP"
+    assert kwargs["preferred_role_2"] is None and kwargs["preferred_role_3"] is None
+
+
+@pytest.mark.asyncio
+async def test_change_roles_rejects_third_without_second_before_service_call():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(
+        update_preferences=AsyncMock(),
+        get_active_match=AsyncMock(),
+    )
+    group = MatchCommandGroup(service)
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+
+    await MatchCommandGroup.change_roles.callback(
+        group,
+        interaction,
+        discord.app_commands.Choice(name="탑", value="TOP"),
+        None,
+        discord.app_commands.Choice(name="미드", value="MID"),
+    )
+
+    service.update_preferences.assert_not_awaited()
+    service.get_active_match.assert_not_awaited()
+    assert "3지망" in interaction.followup.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_change_roles_passes_single_preference_with_optional_slots_none():
+    from inhouse_bot.discord.commands import MatchCommandGroup
+
+    service = SimpleNamespace(
+        update_preferences=AsyncMock(),
+        get_active_match=AsyncMock(return_value=SimpleNamespace(id=42)),
+    )
+    group = MatchCommandGroup(service)
+    group._refresh_message = AsyncMock()
+    interaction = _command_interaction(channel_type=discord.ChannelType.text)
+    interaction.channel.id = 456
+
+    await MatchCommandGroup.change_roles.callback(
+        group,
+        interaction,
+        discord.app_commands.Choice(name="탑", value="TOP"),
+        None,
+        None,
+    )
+
+    service.update_preferences.assert_awaited_once_with(42, 77, "TOP", None, None)
 
 
 def test_phase3a_command_options_are_optional_and_bounded():
@@ -193,8 +362,11 @@ def test_phase3b_command_options_and_names():
     mode = MatchCommandGroup.create._params["assignment_mode"]
     assert mode.required is False and mode.default is None
     assert MatchCommandGroup.create._params["preferred_role_1"].required is True
-    assert MatchCommandGroup.create._params["preferred_role_2"].required is True
+    assert MatchCommandGroup.create._params["preferred_role_2"].required is False
     assert MatchCommandGroup.create._params["preferred_role_3"].required is False
+    assert MatchCommandGroup.change_roles._params["first"].required is True
+    assert MatchCommandGroup.change_roles._params["second"].required is False
+    assert MatchCommandGroup.change_roles._params["third"].required is False
     assert MatchCommandGroup.ranking._params["role"].required is False
     assert MatchCommandGroup.set_mmr.name == "mmr설정"
     assert MatchCommandGroup.set_mmr._params["game"].autocomplete is not None
@@ -235,8 +407,9 @@ async def test_usage_command_sends_ephemeral_command_guide():
         "/내전 패치내역",
     ):
         assert command in guide
-    assert "선택할 모든 지망" in guide
-    assert "1·2지망을 반드시 선택" in guide
+    assert "제출한 모든 지망" in guide
+    assert "1지망은 필수" in guide
+    assert "3지망을 쓰려면 2지망" in guide
     assert "생성자는 자동으로 참가" in guide
     assert "모집/준비 확인 중" in guide
     assert "모집·준비 마감 이후" in guide
@@ -262,9 +435,10 @@ async def test_patch_notes_command_sends_ephemeral_version_history():
     kwargs = interaction.followup.send.await_args.kwargs
     assert kwargs["ephemeral"] is True
     embed = kwargs["embed"]
-    assert __version__ == "1.0.3"
-    assert embed.title == "내전 봇 패치 내역 · v1.0.3"
+    assert __version__ == "1.0.4"
+    assert embed.title == "내전 봇 패치 내역 · v1.0.4"
     history = "\n".join(f"{field.name}\n{field.value}" for field in embed.fields)
+    assert "v1.0.4" in history
     assert "v1.0.3" in history
     assert "v1.0.2" in history
     assert "v1.0.1" in history

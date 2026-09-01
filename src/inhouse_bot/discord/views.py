@@ -440,7 +440,9 @@ class MatchView(discord.ui.View):
 
 class JoinPreferencesModal(discord.ui.Modal, title="내전 참가 라인 입력"):
     first = discord.ui.TextInput(label="1지망", placeholder="탑 / 정글 / 미드 / 원딜 / 서폿")
-    second = discord.ui.TextInput(label="2지망", placeholder="탑 / 정글 / 미드 / 원딜 / 서폿")
+    second = discord.ui.TextInput(
+        label="2지망", placeholder="선택 입력 (탑 / 정글 / 미드 / 원딜 / 서폿)", required=False
+    )
     third = discord.ui.TextInput(
         label="3지망", placeholder="선택 입력", required=False
     )
@@ -458,12 +460,20 @@ class JoinPreferencesModal(discord.ui.Modal, title="내전 참가 라인 입력"
             # read.  Validate the persisted guild before joining so a modal
             # opened from a stale/foreign server can never mutate the match.
             await view._match_for_interaction(interaction)
+            first = str(self.first).strip() or None
+            second = str(self.second).strip() or None
+            third = str(self.third).strip() or None
+            if third is not None and second is None:
+                await view._followup(
+                    interaction, "3지망을 입력하려면 2지망도 입력해야 합니다."
+                )
+                return
             result = await view.service.join_match(
                 view.match_id,
                 int(interaction.user.id),
-                preferred_role_1=str(self.first),
-                preferred_role_2=str(self.second),
-                preferred_role_3=str(self.third) or None,
+                preferred_role_1=first,
+                preferred_role_2=second,
+                preferred_role_3=third,
             )
             text = "대기열에 등록했습니다." if _get(result, "waitlisted", False) else "내전에 참가했습니다."
         except MatchError as exc:
