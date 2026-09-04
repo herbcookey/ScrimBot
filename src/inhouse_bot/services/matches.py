@@ -32,6 +32,8 @@ from inhouse_bot.repositories.matches import (
     MatchError,
     MatchEvent,
     MatchFullError,
+    MatchHistoryDetail,
+    MatchHistoryPage,
     MatchNotFoundError,
     MatchRepository,
     SEASON_NAME_MAX_LENGTH,
@@ -350,6 +352,28 @@ class MatchService:
             guild_id, user_id, game_key=game_key, season_id=season_id
         )
 
+    async def match_history(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        game_key: str = "lol",
+        season_id: int | None = None,
+        page: int = 1,
+    ) -> MatchHistoryPage:
+        if int(page) < 1:
+            raise ValueError("페이지는 1 이상이어야 합니다.")
+        return await self.repository.match_history(
+            guild_id, user_id, game_key=game_key, season_id=season_id, page=page
+        )
+
+    async def match_history_detail(
+        self, guild_id: int, match_id: int
+    ) -> MatchHistoryDetail | None:
+        if int(match_id) < 1:
+            raise ValueError("경기번호는 양의 정수여야 합니다.")
+        return await self.repository.match_history_detail(guild_id, match_id)
+
     async def list_games(self) -> list[Game]:
         return await self.repository.list_games()
 
@@ -571,6 +595,8 @@ __all__ = [
     "MatchError",
     "MatchEvent",
     "MatchFullError",
+    "MatchHistoryDetail",
+    "MatchHistoryPage",
     "MatchNotFoundError",
     "MatchRepository",
     "MatchResult",

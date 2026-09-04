@@ -18,7 +18,7 @@ from inhouse_bot.role_assignment import (
     parse_compact_tier,
 )
 
-from .renderer import render_match
+from .renderer import render_match, render_match_history, render_match_history_detail
 from .views import MatchView, SAFE_MENTIONS
 from .voice import (
     VoiceMoveSummary,
@@ -181,6 +181,8 @@ class MatchCommandGroup(app_commands.Group):
             name="4. MMR과 기록",
             value=(
                 "`/내전 전적 [사용자] [게임] [시즌]` · 전적과 승률 조회\n"
+                "`/내전 기록 [사용자] [게임] [시즌] [페이지]` · 종료 경기와 MMR 변동 조회\n"
+                "`/내전 경기조회 경기번호` · 종료 경기의 팀과 참가자별 MMR 상세 조회\n"
                 "`/내전 랭킹 [게임] [시즌] [라인] [인원수]` · 시즌 MMR 순위 조회"
             ),
             inline=False,
@@ -206,6 +208,16 @@ class MatchCommandGroup(app_commands.Group):
             title=f"내전 봇 패치 내역 · v{__version__}",
             description="최신 버전부터 주요 변경 사항을 안내합니다.",
             colour=0x57F287,
+        )
+        embed.add_field(
+            name="v1.1.0 · 2026-09-04",
+            value=(
+                "• `/내전 기록` 종료 경기 목록·페이지 및 당시 MMR 변동 조회 추가\n"
+                "• `/내전 경기조회` 팀 구성·라인·참가자별 MMR 상세 조회 추가\n"
+                "• 현재 점수가 아닌 경기별 MMR 이력만 사용하고 서버 범위 검증 강화\n"
+                "• 긴 기록도 Discord Embed 제한 안에서 결정적으로 축약"
+            ),
+            inline=False,
         )
         embed.add_field(
             name="v1.0.4 · 2026-09-02",
@@ -557,6 +569,85 @@ class MatchCommandGroup(app_commands.Group):
         except Exception:
             logger.exception("내전 전적 조회 실패")
             await self._send(interaction, "전적 조회 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="기록", description="사용자의 종료 경기 기록과 MMR 변동을 조회합니다.")
+    @app_commands.describe(user="기록을 조회할 사용자", game="게임", season="시즌 ID", page="페이지")
+    @app_commands.rename(user="사용자", game="게임", season="시즌", page="페이지")
+    async def history(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member | None = None,
+        game: str | None = None,
+        season: int | None = None,
+        page: app_commands.Range[int, 1] = 1,
+    ) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        if int(page) < 1:
+            await self._send(interaction, "페이지는 1 이상이어야 합니다.")
+            return
+        await self._defer(interaction)
+        target = user or interaction.user
+        try:
+            result = await self.service.match_history(
+                int(interaction.guild.id), int(target.id),
+                game_key=game or "lol", season_id=season, page=int(page),
+            )
+            await self._send_embed(interaction, render_match_history(result, int(target.id)))
+        except MatchError as exc:
+            await self._send(interaction, str(exc) or "경기 기록을 조회할 수 없습니다.")
+        except ValueError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("내전 경기 기록 조회 실패")
+            await self._send(interaction, "경기 기록 조회 중 오류가 발생했습니다.")
+
+    @app_commands.command(name="경기조회", description="경기번호로 종료 경기 상세 기록을 조회합니다.")
+    @app_commands.describe(match_id="조회할 경기번호")
+    @app_commands.rename(match_id="경기번호")
+    async def history_detail(
+        self,
+        interaction: discord.Interaction,
+        match_id: app_commands.Range[int, 1],
+    ) -> None:
+        if interaction.guild is None:
+            await self._send(interaction, "서버에서만 사용할 수 있습니다.")
+            return
+        if int(match_id) < 1:
+            await self._send(interaction, "경기번호는 양의 정수여야 합니다.")
+            return
+        await self._defer(interaction)
+        try:
+            detail = await self.service.match_history_detail(
+                int(interaction.guild.id), int(match_id)
+            )
+            if detail is None:
+                await self._send(interaction, "경기를 찾을 수 없습니다.")
+                return
+            status = str(_get(detail, "status", ""))
+            if (
+                status in {"RECRUITING", "READY_CHECK", "DRAFTING", "PLAYING"}
+                and _get(detail, "ended_at") is None
+            ):
+                text = "활성 경기입니다. 현재 모집 패널을 확인해 주세요."
+                try:
+                    ids = tuple(int(_get(detail, key)) for key in ("guild_id", "channel_id", "message_id"))
+                except (TypeError, ValueError):
+                    ids = ()
+                if ids and min(ids) > 0:
+                    text += f"\nhttps://discord.com/channels/{ids[0]}/{ids[1]}/{ids[2]}"
+                await self._send(interaction, text)
+                return
+            if status != "FINISHED" or not _get(detail, "winner_team"):
+                await self._send(interaction, "조회할 수 있는 종료 경기 기록이 없습니다.")
+                return
+            await self._send_embed(interaction, render_match_history_detail(detail))
+        except ValueError as exc:
+            await self._send(interaction, str(exc))
+        except Exception:
+            logger.exception("내전 경기 상세 조회 실패")
+            await self._send(interaction, "경기 상세 조회 중 오류가 발생했습니다.")
 
     @app_commands.command(name="시즌시작", description="새 시즌을 시작합니다.")
     @app_commands.describe(game="게임", name="시즌 이름")
@@ -910,6 +1001,7 @@ class MatchCommandGroup(app_commands.Group):
 
     @create.autocomplete("game")
     @stats.autocomplete("game")
+    @history.autocomplete("game")
     @season_start.autocomplete("game")
     @season_end.autocomplete("game")
     @ranking.autocomplete("game")

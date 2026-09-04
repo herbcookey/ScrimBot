@@ -400,6 +400,8 @@ async def test_usage_command_sends_ephemeral_command_guide():
         "/내전 결과",
         "/내전 등록",
         "/내전 전적",
+        "/내전 기록",
+        "/내전 경기조회",
         "/내전 랭킹",
         "/내전 시즌시작",
         "/내전 mmr설정",
@@ -435,9 +437,10 @@ async def test_patch_notes_command_sends_ephemeral_version_history():
     kwargs = interaction.followup.send.await_args.kwargs
     assert kwargs["ephemeral"] is True
     embed = kwargs["embed"]
-    assert __version__ == "1.0.4"
-    assert embed.title == "내전 봇 패치 내역 · v1.0.4"
+    assert __version__ == "1.1.0"
+    assert embed.title == "내전 봇 패치 내역 · v1.1.0"
     history = "\n".join(f"{field.name}\n{field.value}" for field in embed.fields)
+    assert "v1.1.0" in history
     assert "v1.0.4" in history
     assert "v1.0.3" in history
     assert "v1.0.2" in history

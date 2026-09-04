@@ -244,4 +244,190 @@ def render_match(match: Any) -> discord.Embed:
     return embed
 
 
-__all__ = ["render_match"]
+def _truncate(value: Any, limit: int) -> str:
+    text = str(value or "-")
+    return text if len(text) <= limit else text[:max(0, limit - 1)] + "…"
+
+
+def _panel_link(value: Any) -> str | None:
+    ids = tuple(_get(value, name) for name in ("guild_id", "channel_id", "message_id"))
+    try:
+        guild_id, channel_id, message_id = (int(item) for item in ids)
+    except (TypeError, ValueError):
+        return None
+    if min(guild_id, channel_id, message_id) <= 0:
+        return None
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+
+def _rating_change(value: Any, *, show_role: bool) -> str:
+    before = _get(value, "rating_before")
+    after = _get(value, "rating_after")
+    delta = _get(value, "rating_delta")
+    if before is None or after is None or delta is None:
+        return "변동 기록 없음"
+    prefix = ""
+    role = _get(value, "assigned_role")
+    if show_role and role:
+        prefix = f"{ROLE_LABELS.get(str(role), str(role))} · "
+    delta_text = f"+{int(delta):,}" if int(delta) > 0 else f"{int(delta):,}"
+    return f"{prefix}{int(before):,} → {int(after):,} ({delta_text})"
+
+
+def _add_bounded_field(
+    embed: discord.Embed, name: Any, value: Any, *, inline: bool = False
+) -> bool:
+    if len(embed.fields) >= 25:
+        return False
+    field_name = _truncate(name, 256)
+    remaining = 5900 - len(embed) - len(field_name)
+    if remaining <= 0:
+        return False
+    field_value = _truncate(value, min(1024, remaining))
+    embed.add_field(name=field_name, value=field_value, inline=inline)
+    return True
+
+
+def render_match_history(page: Any, user_id: int) -> discord.Embed:
+    """사용자 종료 경기 페이지를 Discord 제한 안에서 표시한다."""
+
+    scope_name = str(_get(page, "scope_name", "전체 시즌"))
+    embed = discord.Embed(
+        title=_truncate(f"<@{int(user_id)}>님의 경기 기록 · {scope_name}", 256),
+        colour=0x57F287,
+    )
+    entries = tuple(_get(page, "entries", ()) or ())
+    if not entries:
+        embed.description = "조건에 맞는 종료 경기 기록이 없습니다."
+    for entry in entries:
+        ended = _deadline_value(_get(entry, "ended_at"))
+        team = str(_get(entry, "team"))
+        winner = str(_get(entry, "winner_team"))
+        mode = "균형 배정" if str(_get(entry, "assignment_mode")) == "BALANCED" else "드래프트"
+        if bool(_get(entry, "role_rating_enabled")):
+            rating = _rating_change(entry, show_role=True)
+        elif _get(entry, "rating_before") is None and not bool(_get(entry, "rating_enabled", True)):
+            rating = "MMR 미사용"
+        else:
+            rating = _rating_change(entry, show_role=False)
+        lines = [
+            f"{_get(entry, 'game_name')} · {_get(entry, 'season_name')}",
+            f"종료: {ended}",
+            f"배정: {mode} · 내 팀: {team}팀 · {'승리' if team == winner else '패배'}",
+            f"승리팀: {winner}팀",
+        ]
+        if bool(_get(entry, "role_rating_enabled")) and _get(entry, "assigned_role"):
+            lines.append(f"배정 라인: {ROLE_LABELS.get(str(_get(entry, 'assigned_role')), str(_get(entry, 'assigned_role')))}")
+        lines.append(f"MMR: {rating}")
+        link = _panel_link(entry)
+        if link:
+            lines.append(f"[원본 모집 패널]({link})")
+        _add_bounded_field(
+            embed,
+            f"#{int(_get(entry, 'id'))} · {_get(entry, 'title')}",
+            "\n".join(lines),
+        )
+    embed.set_footer(
+        text=_truncate(
+            f"요청 페이지 {int(_get(page, 'page', 1))} · 전체 {int(_get(page, 'total_pages', 1))}페이지",
+            2048,
+        )
+    )
+    return embed
+
+
+def _participant_history_line(item: Any, *, role_enabled: bool, rating_enabled: bool) -> str:
+    prefix = _mention(_get(item, "user_id"))
+    if role_enabled and _get(item, "assigned_role"):
+        prefix = f"{ROLE_LABELS.get(str(_get(item, 'assigned_role')), str(_get(item, 'assigned_role')))} · {prefix}"
+    if role_enabled or rating_enabled:
+        prefix += f" · {_rating_change(item, show_role=False)}"
+    return prefix
+
+
+def _add_team_fields(
+    embed: discord.Embed,
+    team: str,
+    participants: list[Any],
+    *,
+    role_enabled: bool,
+    rating_enabled: bool,
+    winner_team: str,
+) -> None:
+    lines = [
+        _participant_history_line(
+            item, role_enabled=role_enabled, rating_enabled=rating_enabled
+        ) for item in participants
+    ] or ["-"]
+    value_limit = 900  # 두 팀의 최소 field와 결과 메모 예산을 남긴다.
+    shown = 0
+    for index in range(2):
+        name = f"{team}팀{' · 승리' if team == winner_team else ''}"
+        if index:
+            name += f" ({index + 1})"
+        value_lines: list[str] = []
+        while shown < len(lines):
+            candidate = "\n".join((*value_lines, lines[shown]))
+            if len(candidate) > value_limit:
+                break
+            value_lines.append(lines[shown])
+            shown += 1
+        omitted = len(lines) - shown
+        if index == 1 and omitted:
+            suffix = f"외 {omitted}명"
+            while value_lines and len("\n".join((*value_lines, suffix))) > value_limit:
+                value_lines.pop()
+                shown -= 1
+                omitted += 1
+                suffix = f"외 {omitted}명"
+            value_lines.append(suffix)
+        if not _add_bounded_field(embed, name, "\n".join(value_lines)):
+            break
+        if shown == len(lines):
+            break
+
+
+def render_match_history_detail(detail: Any) -> discord.Embed:
+    """종료 경기와 참가자별 이력만으로 상세 Embed를 만든다."""
+
+    embed = discord.Embed(
+        title=_truncate(f"경기 #{int(_get(detail, 'id'))} · {_get(detail, 'title')}", 256),
+        colour=0x5865F2,
+    )
+    mode = "균형 배정" if str(_get(detail, "assignment_mode")) == "BALANCED" else "드래프트"
+    lines = [
+        f"게임: {_truncate(_get(detail, 'game_name'), 256)}",
+        f"시즌: {_truncate(_get(detail, 'season_name'), 100)}",
+        f"배정: {mode}",
+        f"생성자: {_mention(_get(detail, 'creator_id'))}",
+        f"생성: {_deadline_value(_get(detail, 'created_at'))}",
+        f"시작: {_deadline_value(_get(detail, 'started_at'))}",
+        f"종료: {_deadline_value(_get(detail, 'ended_at'))}",
+        f"승리팀: {_get(detail, 'winner_team')}팀",
+    ]
+    link = _panel_link(detail)
+    if link:
+        lines.append(f"[원본 모집 패널]({link})")
+    embed.description = _truncate("\n".join(lines), 1024)
+    role_enabled = bool(_get(detail, "role_rating_enabled"))
+    rating_enabled = bool(_get(detail, "rating_enabled"))
+    if not role_enabled and not rating_enabled:
+        _add_bounded_field(embed, "MMR", "MMR 미사용")
+    participants = tuple(_get(detail, "participants", ()) or ())
+    winner = str(_get(detail, "winner_team"))
+    for team in ("A", "B"):
+        _add_team_fields(
+            embed,
+            team,
+            [item for item in participants if str(_get(item, "team")) == team],
+            role_enabled=role_enabled,
+            rating_enabled=rating_enabled,
+            winner_team=winner,
+        )
+    memo = _get(detail, "memo")
+    if memo is not None and str(memo).strip():
+        _add_bounded_field(embed, "결과 메모", str(memo).strip())
+    return embed
+
+
+__all__ = ["render_match", "render_match_history", "render_match_history_detail"]

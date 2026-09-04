@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from math import ceil
 import random
 from typing import Any, Mapping
 from uuid import uuid4
@@ -390,6 +391,70 @@ class RoleStats:
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
+
+
+@dataclass(frozen=True, slots=True)
+class MatchHistoryEntry:
+    id: int
+    guild_id: int
+    channel_id: int
+    message_id: int | None
+    title: str
+    game_name: str
+    season_name: str
+    ended_at: datetime | None
+    assignment_mode: str
+    team: str
+    winner_team: str
+    assigned_role: str | None
+    role_rating_enabled: bool
+    rating_enabled: bool
+    rating_before: int | None
+    rating_delta: int | None
+    rating_after: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MatchHistoryPage:
+    entries: tuple[MatchHistoryEntry, ...]
+    total_count: int
+    page: int
+    total_pages: int
+    scope_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class MatchHistoryParticipant:
+    id: int
+    user_id: int
+    team: str
+    joined_at: datetime | None
+    assigned_role: str | None
+    rating_before: int | None
+    rating_delta: int | None
+    rating_after: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MatchHistoryDetail:
+    id: int
+    guild_id: int
+    channel_id: int
+    message_id: int | None
+    creator_id: int
+    title: str
+    status: str
+    game_name: str
+    season_name: str
+    assignment_mode: str
+    role_rating_enabled: bool
+    rating_enabled: bool
+    created_at: datetime | None
+    started_at: datetime | None
+    ended_at: datetime | None
+    winner_team: str | None
+    memo: str | None
+    participants: tuple[MatchHistoryParticipant, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2087,6 +2152,180 @@ class MatchRepository:
                     match_id, current, int(voice_cleanup_delay_seconds),
                 )
                 return await self._fetch_match(conn, match_id)
+
+    async def match_history(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        game_key: str = "lol",
+        season_id: int | None = None,
+        page: int = 1,
+        page_size: int = 5,
+    ) -> MatchHistoryPage:
+        async with self.pool.acquire() as conn:
+            game = await conn.fetchrow(
+                'SELECT id, role_rating_enabled FROM games WHERE "key" = $1', game_key
+            )
+            if game is None:
+                raise GameNotFoundError()
+            game_id = int(_row_value(game, "id"))
+            effective_season_id = season_id
+            scope_name = "전체 시즌"
+            if season_id is not None:
+                season = await conn.fetchrow(
+                    """SELECT id, name FROM seasons
+                       WHERE id = $1 AND guild_id = $2 AND game_id = $3""",
+                    int(season_id), int(guild_id), game_id,
+                )
+                if season is None:
+                    raise SeasonNotFoundError()
+                scope_name = str(_row_value(season, "name"))
+            elif bool(_row_value(game, "role_rating_enabled")):
+                season = await conn.fetchrow(
+                    """SELECT id, name FROM seasons
+                       WHERE guild_id = $1 AND game_id = $2 AND ended_at IS NULL""",
+                    int(guild_id), game_id,
+                )
+                if season is None:
+                    return MatchHistoryPage((), 0, int(page), 1, "활성 시즌")
+                effective_season_id = int(_row_value(season, "id"))
+                scope_name = str(_row_value(season, "name"))
+
+            params = (
+                int(guild_id), int(user_id), game_id, effective_season_id,
+            )
+            total_count = int(await conn.fetchval(
+                """SELECT count(*)
+                   FROM matches AS m
+                   JOIN match_results AS mr ON mr.match_id = m.id
+                   JOIN match_participants AS mp ON mp.match_id = m.id
+                   WHERE m.guild_id = $1 AND mp.user_id = $2
+                     AND m.game_id = $3 AND m.status = 'FINISHED'
+                     AND mp.membership = 'PARTICIPANT' AND mp.team IN ('A', 'B')
+                     AND ($4::bigint IS NULL OR m.season_id = $4)""",
+                *params,
+            ) or 0)
+            rows = await conn.fetch(
+                """SELECT m.id, m.guild_id, m.channel_id, m.message_id, m.title,
+                          g.name AS game_name, s.name AS season_name, m.ended_at,
+                          m.assignment_mode, mp.team, mr.winner_team, mp.assigned_role,
+                          m.role_rating_enabled, g.rating_enabled,
+                          CASE WHEN m.role_rating_enabled
+                               THEN rrh.rating_before ELSE rh.rating_before END AS rating_before,
+                          CASE WHEN m.role_rating_enabled
+                               THEN rrh.rating_delta ELSE rh.rating_delta END AS rating_delta,
+                          CASE WHEN m.role_rating_enabled
+                               THEN rrh.rating_after ELSE rh.rating_after END AS rating_after
+                   FROM matches AS m
+                   JOIN games AS g ON g.id = m.game_id
+                   JOIN seasons AS s ON s.id = m.season_id
+                   JOIN match_results AS mr ON mr.match_id = m.id
+                   JOIN match_participants AS mp ON mp.match_id = m.id
+                   LEFT JOIN rating_history AS rh
+                     ON rh.match_id = m.id AND rh.user_id = mp.user_id
+                   LEFT JOIN role_rating_history AS rrh
+                     ON rrh.match_id = m.id AND rrh.user_id = mp.user_id
+                   WHERE m.guild_id = $1 AND mp.user_id = $2
+                     AND m.game_id = $3 AND m.status = 'FINISHED'
+                     AND mp.membership = 'PARTICIPANT' AND mp.team IN ('A', 'B')
+                     AND ($4::bigint IS NULL OR m.season_id = $4)
+                   ORDER BY m.ended_at DESC NULLS LAST, m.id DESC
+                   LIMIT $5 OFFSET $6""",
+                *params, int(page_size), (int(page) - 1) * int(page_size),
+            )
+            entries = tuple(MatchHistoryEntry(
+                id=int(_row_value(row, "id")),
+                guild_id=int(_row_value(row, "guild_id")),
+                channel_id=int(_row_value(row, "channel_id")),
+                message_id=_row_value(row, "message_id"),
+                title=str(_row_value(row, "title")),
+                game_name=str(_row_value(row, "game_name")),
+                season_name=str(_row_value(row, "season_name")),
+                ended_at=_row_value(row, "ended_at"),
+                assignment_mode=str(_row_value(row, "assignment_mode")),
+                team=str(_row_value(row, "team")),
+                winner_team=str(_row_value(row, "winner_team")),
+                assigned_role=_row_value(row, "assigned_role"),
+                role_rating_enabled=bool(_row_value(row, "role_rating_enabled")),
+                rating_enabled=bool(_row_value(row, "rating_enabled")),
+                rating_before=_row_value(row, "rating_before"),
+                rating_delta=_row_value(row, "rating_delta"),
+                rating_after=_row_value(row, "rating_after"),
+            ) for row in rows)
+            return MatchHistoryPage(
+                entries, total_count, int(page), max(1, ceil(total_count / int(page_size))),
+                scope_name,
+            )
+
+    async def match_history_detail(
+        self, guild_id: int, match_id: int
+    ) -> MatchHistoryDetail | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT m.id, m.guild_id, m.channel_id, m.message_id, m.creator_id,
+                          m.title, m.status, g.name AS game_name, s.name AS season_name,
+                          m.assignment_mode, m.role_rating_enabled, g.rating_enabled,
+                          m.created_at, m.started_at, m.ended_at,
+                          mr.winner_team, mr.memo
+                   FROM matches AS m
+                   JOIN games AS g ON g.id = m.game_id
+                   JOIN seasons AS s ON s.id = m.season_id
+                   LEFT JOIN match_results AS mr ON mr.match_id = m.id
+                   WHERE m.guild_id = $1 AND m.id = $2""",
+                int(guild_id), int(match_id),
+            )
+            if row is None:
+                return None
+            participant_rows = []
+            if str(_row_value(row, "status")) == FINISHED and _row_value(row, "winner_team"):
+                participant_rows = await conn.fetch(
+                    """SELECT mp.id, mp.user_id, mp.team, mp.joined_at, mp.assigned_role,
+                              CASE WHEN m.role_rating_enabled
+                                   THEN rrh.rating_before ELSE rh.rating_before END AS rating_before,
+                              CASE WHEN m.role_rating_enabled
+                                   THEN rrh.rating_delta ELSE rh.rating_delta END AS rating_delta,
+                              CASE WHEN m.role_rating_enabled
+                                   THEN rrh.rating_after ELSE rh.rating_after END AS rating_after
+                       FROM match_participants AS mp
+                       JOIN matches AS m
+                         ON m.id = mp.match_id AND m.guild_id = $1
+                       LEFT JOIN rating_history AS rh
+                         ON rh.match_id = m.id AND rh.user_id = mp.user_id
+                       LEFT JOIN role_rating_history AS rrh
+                         ON rrh.match_id = m.id AND rrh.user_id = mp.user_id
+                       WHERE m.id = $2 AND mp.membership = 'PARTICIPANT'
+                         AND mp.team IN ('A', 'B')
+                       ORDER BY mp.team,
+                         CASE WHEN m.role_rating_enabled THEN CASE mp.assigned_role
+                           WHEN 'TOP' THEN 1 WHEN 'JUNGLE' THEN 2 WHEN 'MID' THEN 3
+                           WHEN 'ADC' THEN 4 WHEN 'SUPPORT' THEN 5 ELSE 6 END ELSE 0 END,
+                         mp.joined_at ASC NULLS LAST, mp.id ASC, mp.user_id ASC""",
+                    int(guild_id), int(match_id),
+                )
+            participants = tuple(MatchHistoryParticipant(
+                id=int(_row_value(item, "id")),
+                user_id=int(_row_value(item, "user_id")),
+                team=str(_row_value(item, "team")),
+                joined_at=_row_value(item, "joined_at"),
+                assigned_role=_row_value(item, "assigned_role"),
+                rating_before=_row_value(item, "rating_before"),
+                rating_delta=_row_value(item, "rating_delta"),
+                rating_after=_row_value(item, "rating_after"),
+            ) for item in participant_rows)
+            return MatchHistoryDetail(
+                id=int(_row_value(row, "id")), guild_id=int(_row_value(row, "guild_id")),
+                channel_id=int(_row_value(row, "channel_id")), message_id=_row_value(row, "message_id"),
+                creator_id=int(_row_value(row, "creator_id")), title=str(_row_value(row, "title")),
+                status=str(_row_value(row, "status")), game_name=str(_row_value(row, "game_name")),
+                season_name=str(_row_value(row, "season_name")),
+                assignment_mode=str(_row_value(row, "assignment_mode")),
+                role_rating_enabled=bool(_row_value(row, "role_rating_enabled")),
+                rating_enabled=bool(_row_value(row, "rating_enabled")),
+                created_at=_row_value(row, "created_at"), started_at=_row_value(row, "started_at"),
+                ended_at=_row_value(row, "ended_at"), winner_team=_row_value(row, "winner_team"),
+                memo=_row_value(row, "memo"), participants=participants,
+            )
 
     async def stats(
         self,
